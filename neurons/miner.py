@@ -13,6 +13,7 @@ deterministic chunk-level heuristic so it still serves valid scores.
 
 import hashlib
 import os
+import subprocess
 import time
 from collections import Counter
 from pathlib import Path
@@ -54,6 +55,48 @@ def _sha256_file(path: str | Path) -> str:
 
 def _existing_paths(paths: list[str | Path]) -> list[Path]:
     return [p for p in (Path(x).expanduser() for x in paths) if p.exists() and p.is_file()]
+
+
+def _git(args: list[str], repo_root: Path) -> str:
+    """Run a git command in repo_root, returning stripped stdout or "" on failure."""
+    try:
+        out = subprocess.run(
+            ["git", *args],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:  # pragma: no cover - git missing / not a repo
+        return ""
+    if out.returncode != 0:
+        return ""
+    return out.stdout.strip()
+
+
+def _git_commit(repo_root: Path) -> str:
+    """Current HEAD commit hash (manifest policy requires a real git commit)."""
+    return _git(["rev-parse", "HEAD"], repo_root)
+
+
+def _normalize_repo_url(url: str) -> str:
+    """Normalize an origin URL to a public https form, stripping creds/.git suffix."""
+    url = url.strip()
+    if not url:
+        return ""
+    if url.startswith("git@"):  # git@github.com:owner/repo.git
+        host, _, path = url[len("git@"):].partition(":")
+        url = f"https://{host}/{path}"
+    elif url.startswith("ssh://git@"):
+        url = "https://" + url[len("ssh://git@"):]
+    if url.endswith(".git"):
+        url = url[: -len(".git")]
+    return url
+
+
+def _git_remote_url(repo_root: Path) -> str:
+    """Public URL of the origin remote, normalized to https without a .git suffix."""
+    return _normalize_repo_url(_git(["remote", "get-url", "origin"], repo_root))
 
 
 class Miner(BaseMinerNeuron):
@@ -106,6 +149,15 @@ class Miner(BaseMinerNeuron):
         )
         artifact_sha256 = os.getenv("POKER44_MODEL_ARTIFACT_SHA256", _sha256_file(model_artifact_path))
 
+        # Auto-derive the git identity so the manifest is transparent-compliant
+        # out of the box (env vars still take precedence for overrides).
+        repo_url = os.getenv("P44_MANIFEST_REPO_URL") or _git_remote_url(repo_root)
+        repo_commit = (
+            os.getenv("P44_MANIFEST_REPO_COMMIT")
+            or os.getenv("P44_MODEL_REPO_COMMIT")
+            or _git_commit(repo_root)
+        )
+
         return build_local_model_manifest(
             repo_root=repo_root,
             implementation_files=implementation_files,
@@ -117,10 +169,8 @@ class Miner(BaseMinerNeuron):
                     "P44_MANIFEST_FRAMEWORK", "pytorch-hierarchical-transformer-xgboost"
                 ),
                 "license": os.getenv("P44_MANIFEST_LICENSE", "MIT"),
-                "repo_url": os.getenv("P44_MANIFEST_REPO_URL", ""),
-                "repo_commit": os.getenv(
-                    "P44_MANIFEST_REPO_COMMIT", os.getenv("P44_MODEL_REPO_COMMIT", "")
-                ),
+                "repo_url": repo_url,
+                "repo_commit": repo_commit,
                 "artifact_url": os.getenv("P44_MANIFEST_ARTIFACT_URL", ""),
                 "artifact_sha256": artifact_sha256,
                 "model_card_url": os.getenv("P44_MANIFEST_MODEL_CARD_URL", ""),
@@ -136,6 +186,12 @@ class Miner(BaseMinerNeuron):
                 "private_data_attestation": (
                     "This miner does not train on validator-only evaluation data, live eval "
                     "batches, hidden validator labels, or any private validator data."
+                ),
+                "data_attestation": (
+                    "All training data is the public Poker44 benchmark (api.poker44.net) and "
+                    "local sliding-window augmentation derived from it. No private, scraped, or "
+                    "validator-side data is used; the published repo and commit reproduce the "
+                    "full model flow."
                 ),
                 "inference_mode": "remote",
                 "notes": (
@@ -298,7 +354,7 @@ class Miner(BaseMinerNeuron):
                 f"Scored {len(chunks)} chunks with "
                 f"{'trained v2 model' if self.detector else 'heuristic fallback'} | "
                 f"window_hands={self.window_hands} stride={self.window_stride} agg={self.window_agg} | "
-                f"preview={scores[:8]}"
+                f"preview={scores}"
             )
             return synapse
 
