@@ -1,0 +1,636 @@
+from __future__ import annotations
+
+import argparse
+import time
+import csv
+import inspect
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    brier_score_loss,
+    confusion_matrix,
+    log_loss,
+    precision_recall_fscore_support,
+    roc_auc_score,
+)
+
+from .dataset import ChunkSample, augment_chunk_windows, load_public_benchmark
+from .inference import Poker44BotDetector
+from .scoring import reward_metrics
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Evaluate saved Poker44 model on public benchmark chunks."
+    )
+
+    parser.add_argument(
+        "--data",
+        required=True,
+        help="Path to public_miner_benchmark.json.gz",
+    )
+
+    parser.add_argument(
+        "--model",
+        required=True,
+        help="Path to saved PyTorch .pt model artifact.",
+    )
+
+    parser.add_argument(
+        "--xgb-model",
+        default=None,
+        help="Optional path to saved XGBoost .joblib model.",
+    )
+
+    parser.add_argument(
+        "--split",
+        choices=["train", "val", "all"],
+        default="all",
+        help="Which benchmark split to evaluate.",
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=64,
+        help="Inference batch size.",
+    )
+
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Prediction threshold. If omitted, uses detector threshold or 0.5.",
+    )
+
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        help="cpu or cuda",
+    )
+
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Logit temperature for neural model inference.",
+    )
+
+    parser.add_argument(
+        "--out-csv",
+        default=None,
+        help="Optional path to save per-chunk predictions as CSV.",
+    )
+
+    parser.add_argument(
+        "--out-json",
+        default=None,
+        help="Optional path to save metrics as JSON.",
+    )
+
+    parser.add_argument(
+        "--show",
+        type=int,
+        default=20,
+        help="Number of per-chunk rows to print.",
+    )
+
+    # ------------------------------------------------------------------
+    # Evaluation modes
+    # ------------------------------------------------------------------
+
+    parser.add_argument(
+        "--augment-windows",
+        action="store_true",
+        help=(
+            "Evaluate generated fixed-length windows as separate samples. "
+            "Example: [1,2,3,4], [2,3,4,5], ..."
+        ),
+    )
+
+    parser.add_argument(
+        "--window-inference",
+        action="store_true",
+        help=(
+            "Evaluate original chunks by splitting each original chunk into windows, "
+            "scoring each window, then aggregating back to one score per original chunk. "
+            "This mirrors miner.py window inference."
+        ),
+    )
+
+    parser.add_argument(
+        "--window-hands",
+        type=int,
+        default=20,
+        help="Number of consecutive hands per sliding window (match training / miner).",
+    )
+
+    parser.add_argument(
+        "--window-stride",
+        type=int,
+        default=10,
+        help="Sliding window stride (match training / miner).",
+    )
+
+    parser.add_argument(
+        "--window-agg",
+        choices=["mean", "max", "topk_mean"],
+        default="mean",
+        help="How to aggregate window scores back to original chunk score.",
+    )
+
+    parser.add_argument(
+        "--keep-short-window-chunks",
+        action="store_true",
+        help="Keep chunks shorter than --window-hands instead of dropping them.",
+    )
+
+    return parser.parse_args()
+
+
+def load_detector(
+    model_path: str,
+    device: str,
+    temperature: float,
+    xgb_model_path: Optional[str],
+) -> Poker44BotDetector:
+    """
+    Supports both old and new Poker44BotDetector.load() signatures.
+
+    New expected signature:
+        load(path, device=..., temperature=..., xgb_path=...)
+
+    Old signature:
+        load(path, device=...)
+    """
+
+    load_fn = Poker44BotDetector.load
+    sig = inspect.signature(load_fn)
+
+    kwargs: Dict[str, Any] = {
+        "device": device,
+    }
+
+    if "temperature" in sig.parameters:
+        kwargs["temperature"] = temperature
+
+    if xgb_model_path and "xgb_path" in sig.parameters:
+        kwargs["xgb_path"] = xgb_model_path
+
+    detector = load_fn(model_path, **kwargs)
+
+    # Fallback for older inference.py where load() does not accept temperature/xgb_path.
+    if hasattr(detector, "temperature"):
+        detector.temperature = float(temperature)
+
+    if xgb_model_path and not getattr(detector, "xgb_model", None):
+        try:
+            import joblib
+
+            payload = joblib.load(xgb_model_path)
+            detector.xgb_model = payload["xgb_model"]
+            print(f"Loaded XGBoost model manually from: {xgb_model_path}")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not load XGBoost model from {xgb_model_path}: {exc}"
+            ) from exc
+
+    return detector
+
+
+def select_samples(
+    train_samples: List[ChunkSample],
+    val_samples: List[ChunkSample],
+    split: str,
+) -> List[ChunkSample]:
+    if split == "train":
+        return train_samples
+
+    if split == "val":
+        return val_samples
+
+    return train_samples + val_samples
+
+
+def make_windows_for_chunk(
+    chunk: List[Dict[str, Any]],
+    window_hands: int,
+    window_stride: int,
+    keep_short: bool,
+) -> List[List[Dict[str, Any]]]:
+    if not chunk:
+        return []
+
+    n = len(chunk)
+
+    if n < window_hands:
+        return [chunk] if keep_short else []
+
+    windows: List[List[Dict[str, Any]]] = []
+
+    for start in range(0, n - window_hands + 1, window_stride):
+        end = start + window_hands
+        windows.append(chunk[start:end])
+
+    return windows
+
+
+def aggregate_scores(scores: List[float], method: str) -> float:
+    if not scores:
+        return 0.5
+
+    scores = [float(s) for s in scores]
+
+    if method == "max":
+        value = max(scores)
+
+    elif method == "topk_mean":
+        k = min(3, len(scores))
+        top_scores = sorted(scores, reverse=True)[:k]
+        value = sum(top_scores) / len(top_scores)
+
+    else:
+        value = sum(scores) / len(scores)
+
+    return round(max(0.0, min(1.0, value)), 6)
+
+
+def predict_original_chunks_with_windows(
+    detector: Poker44BotDetector,
+    samples: List[ChunkSample],
+    batch_size: int,
+    window_hands: int,
+    window_stride: int,
+    window_agg: str,
+    keep_short: bool,
+) -> Tuple[List[float], List[int]]:
+    """
+    Same idea as miner.py:
+
+        original chunk
+          -> split into windows
+          -> score all windows
+          -> aggregate windows
+          -> one score per original chunk
+
+    Returns:
+        final_scores: one score per original sample
+        window_counts: how many windows were generated per original sample
+    """
+
+    all_windows: List[List[Dict[str, Any]]] = []
+    ranges: List[Tuple[int, int]] = []
+    window_counts: List[int] = []
+
+    cursor = 0
+
+    for sample in samples:
+        windows = make_windows_for_chunk(
+            chunk=sample.chunk,
+            window_hands=window_hands,
+            window_stride=window_stride,
+            keep_short=keep_short,
+        )
+
+        if not windows:
+            # Keep output shape valid.
+            windows = [sample.chunk]
+
+        start = cursor
+        all_windows.extend(windows)
+        cursor += len(windows)
+        end = cursor
+
+        ranges.append((start, end))
+        window_counts.append(len(windows))
+
+    if not all_windows:
+        return [0.5 for _ in samples], [0 for _ in samples]
+
+    window_scores = detector.predict_chunks(
+        all_windows,
+        batch_size=batch_size,
+    )
+
+    final_scores: List[float] = []
+
+    for start, end in ranges:
+        final_scores.append(
+            aggregate_scores(
+                scores=window_scores[start:end],
+                method=window_agg,
+            )
+        )
+
+    return final_scores, window_counts
+
+
+def safe_metrics(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    threshold: float,
+) -> Dict[str, Any]:
+    preds = (scores >= threshold).astype(np.int32)
+
+    metrics: Dict[str, Any] = {}
+
+    metrics["count"] = int(len(labels))
+    metrics["threshold"] = float(threshold)
+
+    metrics["human_count"] = int((labels == 0).sum())
+    metrics["bot_count"] = int((labels == 1).sum())
+
+    metrics["score_min"] = float(scores.min()) if len(scores) else 0.0
+    metrics["score_max"] = float(scores.max()) if len(scores) else 0.0
+    metrics["score_mean"] = float(scores.mean()) if len(scores) else 0.0
+    metrics["score_std"] = float(scores.std()) if len(scores) else 0.0
+
+    human_scores = scores[labels == 0]
+    bot_scores = scores[labels == 1]
+
+    metrics["human_score_mean"] = float(human_scores.mean()) if len(human_scores) else None
+    metrics["bot_score_mean"] = float(bot_scores.mean()) if len(bot_scores) else None
+
+    metrics["accuracy"] = float(accuracy_score(labels, preds)) if len(labels) else 0.0
+
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        labels,
+        preds,
+        labels=[0, 1],
+        average="binary",
+        zero_division=0,
+    )
+
+    metrics["precision_bot"] = float(precision)
+    metrics["recall_bot"] = float(recall)
+    metrics["f1_bot"] = float(f1)
+
+    cm = confusion_matrix(labels, preds, labels=[0, 1])
+
+    metrics["confusion_matrix"] = {
+        "tn_human_pred_human": int(cm[0, 0]),
+        "fp_human_pred_bot": int(cm[0, 1]),
+        "fn_bot_pred_human": int(cm[1, 0]),
+        "tp_bot_pred_bot": int(cm[1, 1]),
+    }
+
+    if len(set(labels.tolist())) > 1:
+        clipped = np.clip(scores, 1e-6, 1 - 1e-6)
+
+        metrics["roc_auc"] = float(roc_auc_score(labels, scores))
+        metrics["pr_auc"] = float(average_precision_score(labels, scores))
+        metrics["log_loss"] = float(log_loss(labels, clipped, labels=[0, 1]))
+        metrics["brier"] = float(brier_score_loss(labels, scores))
+    else:
+        metrics["roc_auc"] = None
+        metrics["pr_auc"] = None
+        metrics["log_loss"] = None
+        metrics["brier"] = None
+
+    # The numbers the validator actually pays on, computed on the (calibrated)
+    # scores exactly as the on-chain reward does. validator_fpr must stay < 0.10.
+    reward = reward_metrics(labels, scores)
+    metrics["validator_reward"] = reward["validator_reward"]
+    metrics["validator_fpr"] = reward["validator_fpr"]
+    metrics["validator_bot_recall"] = reward["validator_bot_recall"]
+    metrics["validator_ap"] = reward["validator_ap_score"]
+    metrics["human_prob_max"] = reward["human_prob_max"]
+    metrics["bot_prob_min"] = reward["bot_prob_min"]
+
+    return metrics
+
+
+def build_rows(
+    samples: List[ChunkSample],
+    scores: List[float],
+    threshold: float,
+    window_counts: Optional[List[int]] = None,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+
+    for idx, (sample, score) in enumerate(zip(samples, scores)):
+        label = int(sample.label)
+        pred = int(score >= threshold)
+
+        chunk_id = getattr(sample, "chunk_id", None) or f"chunk_{idx}"
+
+        row = {
+            "idx": idx,
+            "chunk_id": chunk_id,
+            "label": label,
+            "label_name": "bot" if label == 1 else "human",
+            "score": float(score),
+            "prediction": pred,
+            "prediction_name": "bot" if pred == 1 else "human",
+            "correct": int(label == pred),
+            "chunk_size_hands": len(sample.chunk),
+        }
+
+        if window_counts is not None:
+            row["num_windows"] = int(window_counts[idx])
+
+        rows.append(row)
+
+    return rows
+
+
+def save_csv(path: str | Path, rows: List[Dict[str, Any]]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not rows:
+        return
+
+    fieldnames = list(rows[0].keys())
+
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Saved per-chunk predictions CSV: {path}")
+
+
+def save_json(path: str | Path, data: Dict[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    print(f"Saved metrics JSON: {path}")
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.augment_windows and args.window_inference:
+        raise ValueError(
+            "Use either --augment-windows OR --window-inference, not both.\n"
+            "--augment-windows evaluates each generated window as a row.\n"
+            "--window-inference evaluates original chunks by aggregating window scores."
+        )
+
+    print(f"Loading benchmark: {args.data}")
+    train_samples, val_samples = load_public_benchmark(args.data)
+
+    samples = select_samples(train_samples, val_samples, args.split)
+
+    if not samples:
+        raise RuntimeError(f"No samples found for split: {args.split}")
+
+    print(f"Original selected chunks: {len(samples)}")
+
+    # Mode 1:
+    # Evaluate generated windows directly as samples.
+    if args.augment_windows:
+        before = len(samples)
+
+        samples = augment_chunk_windows(
+            samples,
+            window_hands=args.window_hands,
+            stride=args.window_stride,
+            keep_short_chunks=args.keep_short_window_chunks,
+        )
+
+        print(
+            f"Window-augmented evaluation samples: {before} -> {len(samples)} "
+            f"(window_hands={args.window_hands}, stride={args.window_stride})"
+        )
+
+    print(f"Loading model: {args.model}")
+    detector = load_detector(
+        model_path=args.model,
+        device=args.device,
+        temperature=args.temperature,
+        xgb_model_path=args.xgb_model,
+    )
+
+    threshold = args.threshold
+    if threshold is None:
+        threshold = float(getattr(detector, "threshold", 0.5))
+
+    labels = np.asarray([int(sample.label) for sample in samples], dtype=np.int32)
+
+    print(f"Evaluating split: {args.split}")
+    print(f"Evaluation rows: {len(samples)}")
+    print(f"Human labels: {int((labels == 0).sum())}")
+    print(f"Bot labels: {int((labels == 1).sum())}")
+    print(f"Threshold: {threshold}")
+    print(f"XGBoost enabled: {bool(getattr(detector, 'xgb_model', None))}")
+
+    # Mode 2:
+    # Original chunks -> windows -> aggregate back to original chunks.
+    if args.window_inference:
+        scores, window_counts = predict_original_chunks_with_windows(
+            detector=detector,
+            samples=samples,
+            batch_size=args.batch_size,
+            window_hands=args.window_hands,
+            window_stride=args.window_stride,
+            window_agg=args.window_agg,
+            keep_short=args.keep_short_window_chunks,
+        )
+
+        print(
+            f"Window inference enabled: window_hands={args.window_hands}, "
+            f"stride={args.window_stride}, agg={args.window_agg}"
+        )
+
+    # Default:
+    # Direct one score per current sample.
+    else:
+        chunks = [sample.chunk for sample in samples]
+
+        scores = detector.predict_chunks(
+            chunks,
+            batch_size=args.batch_size,
+        )
+
+        window_counts = None
+
+    if len(scores) != len(samples):
+        raise RuntimeError(
+            f"Wrong score count. samples={len(samples)}, scores={len(scores)}"
+        )
+
+    scores_arr = np.asarray(scores, dtype=np.float32)
+
+    metrics = safe_metrics(labels, scores_arr, threshold)
+
+    metrics["split"] = args.split
+    metrics["model"] = str(args.model)
+    metrics["xgb_model"] = str(args.xgb_model) if args.xgb_model else None
+    metrics["augment_windows"] = bool(args.augment_windows)
+    metrics["window_inference"] = bool(args.window_inference)
+    metrics["window_hands"] = int(args.window_hands)
+    metrics["window_stride"] = int(args.window_stride)
+    metrics["window_agg"] = str(args.window_agg)
+
+    rows = build_rows(
+        samples=samples,
+        scores=scores,
+        threshold=threshold,
+        window_counts=window_counts,
+    )
+
+    print("\n=== Metrics ===")
+    print(json.dumps(metrics, indent=2))
+
+    print(f"\n=== First {args.show} predictions ===")
+    for row in rows[: args.show]:
+        extra = ""
+        if "num_windows" in row:
+            extra = f" windows={row['num_windows']}"
+
+        print(
+            f"idx={row['idx']:04d} "
+            f"chunk_id={row['chunk_id']} "
+            f"label={row['label_name']:<5} "
+            f"score={row['score']:.6f} "
+            f"pred={row['prediction_name']:<5} "
+            f"correct={row['correct']} "
+            f"hands={row['chunk_size_hands']}"
+            f"{extra}"
+        )
+
+    print(f"\n=== First {args.show} mistakes ===")
+    mistake_rows = [row for row in rows if row["correct"] == 0]
+
+    mistake_rows = sorted(
+        mistake_rows,
+        key=lambda r: abs(float(r["score"]) - float(r["label"])),
+        reverse=True,
+    )
+
+    for row in mistake_rows[: args.show]:
+        extra = ""
+        if "num_windows" in row:
+            extra = f" windows={row['num_windows']}"
+
+        print(
+            f"idx={row['idx']:04d} "
+            f"chunk_id={row['chunk_id']} "
+            f"label={row['label_name']:<5} "
+            f"score={row['score']:.6f} "
+            f"pred={row['prediction_name']:<5} "
+            f"hands={row['chunk_size_hands']}"
+            f"{extra}"
+        )
+
+    if args.out_csv:
+        save_csv(args.out_csv, rows)
+
+    if args.out_json:
+        save_json(args.out_json, metrics)
+
+
+if __name__ == "__main__":
+    start = time.perf_counter()
+
+    main()
+
+    end = time.perf_counter()
+    print(f"Execution time: {end - start:.6f} seconds")
