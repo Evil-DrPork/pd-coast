@@ -142,6 +142,7 @@ class Miner(BaseMinerNeuron):
                 model_repo_root / "model" / "hierarchical_model.py",
                 model_repo_root / "model" / "action_vectorizer.py",
                 model_repo_root / "model" / "features.py",
+                model_repo_root / "model" / "stacked.py",
                 model_repo_root / "model" / "calibration.py",
                 model_repo_root / "model" / "scoring.py",
             ]
