@@ -30,7 +30,6 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--temperature", type=float, default=1.0)
 
     parser.add_argument("--threshold", type=float, default=0.5)
 
@@ -83,7 +82,6 @@ def load_chunk_dump(path: str) -> List[ChunkSample]:
 def load_detector(
     model_path: str,
     device: str,
-    temperature: float,
     xgb_model_path: Optional[str],
 ) -> Poker44BotDetector:
 
@@ -92,16 +90,10 @@ def load_detector(
 
     kwargs: Dict[str, Any] = {"device": device}
 
-    if "temperature" in sig.parameters:
-        kwargs["temperature"] = temperature
-
     if xgb_model_path and "xgb_path" in sig.parameters:
         kwargs["xgb_path"] = xgb_model_path
 
     detector = load_fn(model_path, **kwargs)
-
-    if hasattr(detector, "temperature"):
-        detector.temperature = float(temperature)
 
     if xgb_model_path and not getattr(detector, "xgb_model", None):
         import joblib
@@ -319,7 +311,6 @@ def main() -> None:
     detector = load_detector(
         args.model,
         args.device,
-        args.temperature,
         args.xgb_model,
     )
 

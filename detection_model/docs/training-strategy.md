@@ -194,7 +194,6 @@ calibrator.
 | `P44_WINDOW_STRIDE` | = training `--window-stride` (10) | Consistent coverage |
 | `P44_WINDOW_AGG` | `mean` | **FPR safety.** `max`/`topk_mean` let one bot-looking window flip a whole human chunk → false positives → the cliff. `mean` is the human-safe aggregator |
 | `P44_PREDICTION_THRESHOLD` | leave default | Ignored when a calibrator is embedded (the boundary is already at 0.5) |
-| `P44_LOGITS_TEMPERATURE` | 1.0 | Calibration handles scaling now; keep neutral |
 
 ---
 

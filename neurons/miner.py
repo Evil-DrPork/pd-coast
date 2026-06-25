@@ -121,7 +121,6 @@ class Miner(BaseMinerNeuron):
         self.model_device = os.getenv("P44_MODEL_DEVICE", "cpu")
         self.inference_batch_size = int(os.getenv("P44_INFERENCE_BATCH_SIZE", "64"))
         self.prediction_threshold = float(os.getenv("P44_PREDICTION_THRESHOLD", "0.5"))
-        self.temperature = float(os.getenv("P44_LOGITS_TEMPERATURE", "1"))
 
         self.detector = None
         self.model_manifest = self._build_model_manifest(repo_root, model_repo_root)
@@ -222,7 +221,6 @@ class Miner(BaseMinerNeuron):
             self.detector = Poker44BotDetector.load(
                 model_path,
                 device=self.model_device,
-                temperature=self.temperature,
                 xgb_path=self.xgb_path or None,
             )
             env_threshold = os.getenv("P44_PREDICTION_THRESHOLD")

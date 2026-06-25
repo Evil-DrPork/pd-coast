@@ -61,24 +61,16 @@ def parse_args() -> argparse.Namespace:
         help="Inference batch size.",
     )
 
-    parser.add_argument(
-        "--threshold",
-        type=float,
-        default=None,
-        help="Prediction threshold. If omitted, uses detector threshold or 0.5.",
-    )
+    # NOTE: there is intentionally no --threshold flag. The validator classifies
+    # with a hard np.round(score) (boundary 0.5) and the embedded calibrator is
+    # what positions the scores against it, so every metric here is reported at
+    # that exact boundary. A custom threshold would only diverge from how you are
+    # actually scored on-chain.
 
     parser.add_argument(
         "--device",
         default="cpu",
         help="cpu or cuda",
-    )
-
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=1.0,
-        help="Logit temperature for neural model inference.",
     )
 
     parser.add_argument(
@@ -156,14 +148,13 @@ def parse_args() -> argparse.Namespace:
 def load_detector(
     model_path: str,
     device: str,
-    temperature: float,
     xgb_model_path: Optional[str],
 ) -> Poker44BotDetector:
     """
     Supports both old and new Poker44BotDetector.load() signatures.
 
-    New expected signature:
-        load(path, device=..., temperature=..., xgb_path=...)
+    Expected signature:
+        load(path, device=..., xgb_path=...)
 
     Old signature:
         load(path, device=...)
@@ -176,17 +167,10 @@ def load_detector(
         "device": device,
     }
 
-    if "temperature" in sig.parameters:
-        kwargs["temperature"] = temperature
-
     if xgb_model_path and "xgb_path" in sig.parameters:
         kwargs["xgb_path"] = xgb_model_path
 
     detector = load_fn(model_path, **kwargs)
-
-    # Fallback for older inference.py where load() does not accept temperature/xgb_path.
-    if hasattr(detector, "temperature"):
-        detector.temperature = float(temperature)
 
     if xgb_model_path and not getattr(detector, "xgb_model", None):
         try:
@@ -333,14 +317,18 @@ def predict_original_chunks_with_windows(
 def safe_metrics(
     labels: np.ndarray,
     scores: np.ndarray,
-    threshold: float,
 ) -> Dict[str, Any]:
-    preds = (scores >= threshold).astype(np.int32)
+    # Classify at the validator's EXACT boundary so every metric below
+    # reconciles with the validator_* block. The validator does
+    # `preds = np.round(scores)` (0.5 rounds DOWN to human), nothing else.
+    # Using `scores >= threshold` with any other threshold is what made the
+    # confusion matrix disagree with validator_fpr.
+    preds = np.round(scores).astype(np.int32)
 
     metrics: Dict[str, Any] = {}
 
     metrics["count"] = int(len(labels))
-    metrics["threshold"] = float(threshold)
+    metrics["boundary"] = "validator np.round (0.5)"
 
     metrics["human_count"] = int((labels == 0).sum())
     metrics["bot_count"] = int((labels == 1).sum())
@@ -408,14 +396,15 @@ def safe_metrics(
 def build_rows(
     samples: List[ChunkSample],
     scores: List[float],
-    threshold: float,
     window_counts: Optional[List[int]] = None,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
 
     for idx, (sample, score) in enumerate(zip(samples, scores)):
         label = int(sample.label)
-        pred = int(score >= threshold)
+        # Same boundary the validator uses (np.round), so per-chunk predictions
+        # match the confusion matrix and validator_* metrics.
+        pred = int(np.round(score))
 
         chunk_id = getattr(sample, "chunk_id", None) or f"chunk_{idx}"
 
@@ -504,13 +493,8 @@ def main() -> None:
     detector = load_detector(
         model_path=args.model,
         device=args.device,
-        temperature=args.temperature,
         xgb_model_path=args.xgb_model,
     )
-
-    threshold = args.threshold
-    if threshold is None:
-        threshold = float(getattr(detector, "threshold", 0.5))
 
     labels = np.asarray([int(sample.label) for sample in samples], dtype=np.int32)
 
@@ -518,7 +502,7 @@ def main() -> None:
     print(f"Evaluation rows: {len(samples)}")
     print(f"Human labels: {int((labels == 0).sum())}")
     print(f"Bot labels: {int((labels == 1).sum())}")
-    print(f"Threshold: {threshold}")
+    print("Boundary: validator np.round (0.5)")
     print(f"XGBoost enabled: {bool(getattr(detector, 'xgb_model', None))}")
 
     # Mode 2:
@@ -558,7 +542,7 @@ def main() -> None:
 
     scores_arr = np.asarray(scores, dtype=np.float32)
 
-    metrics = safe_metrics(labels, scores_arr, threshold)
+    metrics = safe_metrics(labels, scores_arr)
 
     metrics["split"] = args.split
     metrics["model"] = str(args.model)
@@ -572,7 +556,6 @@ def main() -> None:
     rows = build_rows(
         samples=samples,
         scores=scores,
-        threshold=threshold,
         window_counts=window_counts,
     )
 

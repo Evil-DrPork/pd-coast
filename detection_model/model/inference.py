@@ -30,7 +30,6 @@ class Poker44BotDetector:
         vectorizer: FeatureVectorizer,
         threshold: float = 0.5,
         device: str | torch.device | None = None,
-        temperature: float = 1.0,
         xgb_model: Any = None,
         calibrator: ScoreCalibrator | None = None,
     ):
@@ -39,7 +38,6 @@ class Poker44BotDetector:
         self.action_vectorizer = action_vectorizer
         self.vectorizer = vectorizer
         self.threshold = float(threshold)
-        self.temperature = float(temperature) if temperature and temperature > 0 else 1.0
         self.xgb_model = xgb_model
         # Reward-aware score post-processor. When present it recenters the score
         # geometry so the decision boundary sits at 0.5 with FPR margin; the
@@ -65,7 +63,6 @@ class Poker44BotDetector:
         cls,
         artifact_path: str | Path,
         device: str | torch.device | None = None,
-        temperature: float = 1.0,
         xgb_path: str | Path | None = None,
     ) -> "Poker44BotDetector":
         artifact_path = Path(artifact_path).expanduser()
@@ -127,7 +124,6 @@ class Poker44BotDetector:
             vectorizer=vectorizer,
             threshold=threshold,
             device=device,
-            temperature=temperature,
             xgb_model=xgb_model,
             calibrator=calibrator,
         )
@@ -199,7 +195,7 @@ class Poker44BotDetector:
             hand_meta=batch["hand_meta"],
             hand_end=batch["hand_end"],
         ).view(-1)
-        probs = torch.sigmoid(logits / self.temperature)
+        probs = torch.sigmoid(logits)
         return probs.detach().cpu().numpy().astype(float).tolist()
 
     @torch.no_grad()
