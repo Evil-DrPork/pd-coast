@@ -89,17 +89,18 @@ class Poker44V2Detector:
         art = joblib.load(path)
         if not isinstance(art, dict) or "feature_names" not in art:
             raise ValueError(f"Not a v2 artifact (missing feature_names): {path}")
-        # Blend artifact (LGBM + TCN) or single-model artifact.
+        # Three shapes: single LGBM, LGBM+TCN blend, or TCN-only.
         lgbm = art.get("lgbm_model") or art.get("model")
-        if lgbm is None:
-            raise ValueError(f"v2 artifact has no model/lgbm_model: {path}")
+        seq = art.get("seq_model")
+        if lgbm is None and seq is None:
+            raise ValueError(f"v2 artifact has no model/lgbm_model/seq_model: {path}")
         return cls(
             model=lgbm,
             calibrator=art.get("calibrator") or {},
             feature_names=art["feature_names"],
             threshold=float(art.get("threshold", 0.5)),
             metadata={"backend": art.get("backend"), "val_metrics": art.get("val_metrics")},
-            seq_model=art.get("seq_model"),
+            seq_model=seq,
             blend_weights=art.get("blend_weights"),
         )
 
@@ -124,12 +125,17 @@ class Poker44V2Detector:
         """Return one calibrated bot-risk score per chunk (higher = more bot-like)."""
         if not chunks:
             return []
-        x = self._feature_rows(chunks)
-        raw = self._raw_scores(x)
-        if self.seq_model is not None and self.blend_weights is not None:
+        if self.model is not None:
+            raw = self._raw_scores(self._feature_rows(chunks))
+        else:
+            raw = np.zeros(len(chunks), dtype=float)   # TCN-only: no LGBM half
+        if self.seq_model is not None:
             seq = np.asarray(self.seq_model.predict_proba(chunks))[:, 1]
-            w0, w1 = self.blend_weights
-            raw = w0 * raw + w1 * seq
+            if self.blend_weights is not None:
+                w0, w1 = self.blend_weights
+                raw = w0 * raw + w1 * seq
+            else:
+                raw = seq
         raw = np.clip(raw, 0.0, 1.0)
         if return_raw or not self.has_calibrator:
             return [round(float(v), 6) for v in raw]
