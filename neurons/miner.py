@@ -1,9 +1,9 @@
-"""Poker44 miner using the model_v2 feature-based bot-detection model.
+"""Poker44 miner using the model_v3 order-invariant bot detector.
 
 Pipeline per validator chunk:
     chunk -> order-invariant hand/chunk features (actions sorted by action_id)
-          -> Poker44V2Detector.predict_chunks (LightGBM + embedded cliff-aware
-             monotone calibrator)
+          -> Poker44V3Detector.predict_chunks (regularized ensemble + monotone
+             batch boundary mapping)
           -> one calibrated risk_score per chunk
 
 An optional top-K cap forces only the K highest-scoring chunks above the 0.5
@@ -36,10 +36,10 @@ load_dotenv()
 MODEL_REPO_PATH = "detection_model"
 
 try:
-    from detection_model.model_v2.inference import Poker44V2Detector
+    from detection_model.model_v3.inference import Poker44V3Detector
     MODEL_IMPORT_ERROR = ""
 except Exception as exc:  # pragma: no cover - keep the miner alive on import error
-    Poker44V2Detector = None
+    Poker44V3Detector = None
     MODEL_IMPORT_ERROR = str(exc)
 
 
@@ -101,16 +101,16 @@ def _git_remote_url(repo_root: Path) -> str:
 
 
 class Miner(BaseMinerNeuron):
-    """Scores each DetectionSynapse chunk with the trained v2 Poker44 model."""
+    """Scores each DetectionSynapse chunk with the trained v3 Poker44 model."""
 
     def __init__(self, config=None):
         super(Miner, self).__init__(config=config)
-        bt.logging.info("🤖 Poker44 v2 trained-model miner started")
+        bt.logging.info("🤖 Poker44 v3 trained-model miner started")
 
         repo_root = Path(__file__).resolve().parents[1]
         model_repo_root = Path(MODEL_REPO_PATH).expanduser()
 
-        self.model_path = os.getenv("P44_MODEL_PATH", "detection_model/artifacts/p44_v2_lgbm_canon.joblib")
+        self.model_path = os.getenv("P44_MODEL_PATH", "detection_model/artifacts/p44_v3.joblib")
         self.prediction_threshold = float(os.getenv("P44_PREDICTION_THRESHOLD", "0.5"))
 
         # Top-K bot cap. When enabled, only the K highest-scoring chunks in a
@@ -139,15 +139,13 @@ class Miner(BaseMinerNeuron):
         implementation_files = _existing_paths(
             [
                 Path(__file__).resolve(),
-                model_repo_root / "model_v2" / "inference.py",
-                model_repo_root / "model_v2" / "features.py",
-                model_repo_root / "model_v2" / "schema.py",
-                model_repo_root / "model_v2" / "dataset.py",
-                model_repo_root / "model_v2" / "calibrate.py",
-                model_repo_root / "model_v2" / "metrics.py",
-                model_repo_root / "model_v2" / "train.py",
-                model_repo_root / "model_v2" / "sequence_model.py",
-                model_repo_root / "model_v2" / "train_stack.py",
+                model_repo_root / "model_v3" / "inference.py",
+                model_repo_root / "model_v3" / "features.py",
+                model_repo_root / "model_v3" / "schema.py",
+                model_repo_root / "model_v3" / "model.py",
+                model_repo_root / "model_v3" / "calibration.py",
+                model_repo_root / "model_v3" / "metrics.py",
+                model_repo_root / "model_v3" / "train.py",
             ]
         )
         artifact_sha256 = os.getenv("POKER44_MODEL_ARTIFACT_SHA256", _sha256_file(model_artifact_path))
@@ -166,10 +164,10 @@ class Miner(BaseMinerNeuron):
             implementation_files=implementation_files,
             defaults={
                 "open_source": True,
-                "model_name": os.getenv("P44_MANIFEST_MODEL_NAME", "p44-v2-lgbm-tabular"),
-                "model_version": os.getenv("P44_MANIFEST_MODEL_VERSION", "2.1.0"),
+                "model_name": os.getenv("P44_MANIFEST_MODEL_NAME", "p44-v3-order-free-ensemble"),
+                "model_version": os.getenv("P44_MANIFEST_MODEL_VERSION", "3.0.0"),
                 "framework": os.getenv(
-                    "P44_MANIFEST_FRAMEWORK", "lightgbm-tabular-features"
+                    "P44_MANIFEST_FRAMEWORK", "scikit-learn-order-free-ensemble"
                 ),
                 "license": os.getenv("P44_MANIFEST_LICENSE", "MIT"),
                 "repo_url": repo_url,
@@ -198,19 +196,18 @@ class Miner(BaseMinerNeuron):
                 ),
                 "inference_mode": "remote",
                 "notes": (
-                    "Poker44 model_v2 tabular bot detector. Order-invariant hand/chunk features "
-                    "(action-type ratios, street-reached rates, amount buckets/quantiles, entropy "
-                    "and poker-validity anomaly rates; actions sorted by action_id) -> LightGBM "
-                    "chunk classifier -> embedded monotone cliff-aware calibrator that places the "
-                    "0.5 boundary under the FPR cliff. Whole-chunk scoring, no hand-order "
-                    f"assumptions. Local artifact: {model_artifact_path}"
+                    "Poker44 model_v3 detector. Distributional order-invariant chunk features -> "
+                    "regularized linear/tree ensemble plus human-tail prototype -> monotone "
+                    "query-batch boundary mapper. All hands are used; action order is preserved "
+                    "only within each hand and no cross-hand order is assumed. "
+                    f"Local artifact: {model_artifact_path}"
                 ),
             },
         )
 
     def _load_trained_model(self) -> None:
-        if Poker44V2Detector is None:
-            bt.logging.error(f"Could not import Poker44V2Detector: {MODEL_IMPORT_ERROR}")
+        if Poker44V3Detector is None:
+            bt.logging.error(f"Could not import Poker44V3Detector: {MODEL_IMPORT_ERROR}")
             bt.logging.error("Miner will use the heuristic fallback.")
             return
 
@@ -220,19 +217,15 @@ class Miner(BaseMinerNeuron):
             return
 
         try:
-            bt.logging.info(f"Loading model_v2 tabular model from: {model_path}")
-            self.detector = Poker44V2Detector.load(model_path)
+            bt.logging.info(f"Loading model_v3 ensemble from: {model_path}")
+            self.detector = Poker44V3Detector.load(model_path)
             env_threshold = os.getenv("P44_PREDICTION_THRESHOLD")
             if env_threshold is not None:
                 self.prediction_threshold = float(env_threshold)
-            elif hasattr(self.detector, "threshold"):
-                self.prediction_threshold = float(self.detector.threshold)
-
-            bt.logging.info("✅ model_v2 loaded successfully")
+            bt.logging.info("✅ model_v3 loaded successfully")
             bt.logging.info(
-                f"Backend: {self.detector.metadata.get('backend')} | "
-                f"features: {len(self.detector.feature_names)} | "
-                f"embedded calibrator: {getattr(self.detector, 'has_calibrator', False)} | "
+                f"features: {len(self.detector.artifact.get('feature_names', []))} | "
+                f"training chunks: {self.detector.artifact.get('training_count')} | "
                 f"threshold={self.prediction_threshold}"
             )
         except Exception as exc:
@@ -255,7 +248,7 @@ class Miner(BaseMinerNeuron):
     # ---------------------------------------------------------------- scoring
 
     def _predict_chunks(self, chunks: list[list[dict]]) -> list[float]:
-        """Whole-chunk, order-invariant scoring via the model_v2 detector."""
+        """Whole-chunk, order-invariant scoring via the model_v3 detector."""
         if self.detector is None:
             return [self.score_chunk(chunk) for chunk in chunks]
         return self.detector.predict_chunks(chunks)
@@ -263,13 +256,11 @@ class Miner(BaseMinerNeuron):
     def _finalize_score(self, score: float) -> float:
         """Final value sent to the validator.
 
-        model_v2 artifacts embed a monotone cliff-aware calibrator, so the detector
-        already returns a score whose 0.5 boundary is correctly placed under the FPR
-        cliff — just clamp and round. Artifacts without a calibrator fall back to the
-        piecewise remap that pins the artifact threshold to 0.5.
+        The v3 detector already applies the OOF/batch monotone mapper, so only
+        finite clamping and rounding are required here.
         """
         score = max(0.0, min(1.0, float(score)))
-        if bool(getattr(self.detector, "has_calibrator", False)):
+        if Poker44V3Detector is not None and isinstance(self.detector, Poker44V3Detector):
             return round(score, 6)
         threshold = self.prediction_threshold
         if threshold <= 0.0 or threshold >= 1.0:
@@ -354,7 +345,7 @@ class Miner(BaseMinerNeuron):
             effective_k = self._resolve_top_k(len(scores))
             bt.logging.info(
                 f"Scored {len(chunks)} chunks with "
-                f"{'model_v2 tabular' if self.detector else 'heuristic fallback'} | "
+                f"{'model_v3 ensemble' if self.detector else 'heuristic fallback'} | "
                 f"top_k={effective_k or 'off'} bots={sum(s >= 0.5 for s in scores)} | "
                 f"preview={scores}"
             )
@@ -421,7 +412,7 @@ class Miner(BaseMinerNeuron):
 
 if __name__ == "__main__":
     with Miner() as miner:
-        bt.logging.info("Poker44 v2 trained-model miner running...")
+        bt.logging.info("Poker44 v3 trained-model miner running...")
         while True:
             bt.logging.info(f"Miner UID: {miner.uid} | Incentive: {miner.metagraph.I[miner.uid]}")
             time.sleep(5 * 60)

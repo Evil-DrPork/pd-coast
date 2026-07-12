@@ -1,6 +1,10 @@
 .venv
 __pycache__
 tools
+!tools/
+tools/*
+!tools/__init__.py
+!tools/get_dump.py
 outputs
 data
 mismatched
