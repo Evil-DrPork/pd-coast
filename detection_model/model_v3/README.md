@@ -66,3 +66,23 @@ python -m detection_model.model_v3.evaluate \
 
 This reports prediction distribution and permutation invariance, but correctly
 does not claim accuracy or validator reward without labels.
+
+## Evaluate 100 batches of 100 merged 80–100-hand chunks
+
+Train through July 9, then use July 10–12 only as future source chunks:
+
+```bash
+python -m detection_model.model_v3.evaluate_large \
+  --data detection_model/data_v3/benchmark_chunks_2026-07-06_to_2026-07-12.json \
+  --model detection_model/artifacts/p44_v3_through_2026-07-09.joblib \
+  --min-date 2026-07-10 \
+  --batch-size 100 \
+  --sources-per-chunk 3 \
+  --min-hands 80 \
+  --max-hands 100 \
+  --repetitions 100 \
+  --out detection_model/artifacts/p44_v3_large_future_eval.json
+```
+
+The evaluator refuses training/evaluation date overlap and does not reuse a
+source chunk inside one synthetic 100-chunk batch.
