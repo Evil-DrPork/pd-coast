@@ -39,7 +39,7 @@ class Poker44V3Detector:
             return ([], {}) if return_diagnostics else []
         clean = [[clean_hand(h) for h in (chunk or []) if isinstance(h, dict)] for chunk in chunks]
         x = matrix_for_chunks(clean)
-        branches = self.model.branch_scores(x)
+        branches = self.model.branch_scores(x, clean) if getattr(self.model, "requires_chunks", False) else self.model.branch_scores(x)
         raw = np.clip(branches @ self.model.branch_weights_, 1e-5, 1 - 1e-5)
         scores = self.map_scores(raw, batch_map=batch_map)
         scores = np.nan_to_num(scores, nan=0.5, posinf=0.99, neginf=0.01)
@@ -63,7 +63,7 @@ class Poker44V3Detector:
         """Return the uncalibrated ensemble scores for reusable window analysis."""
         clean = [[clean_hand(h) for h in (chunk or []) if isinstance(h, dict)] for chunk in chunks]
         x = matrix_for_chunks(clean)
-        branches = self.model.branch_scores(x)
+        branches = self.model.branch_scores(x, clean) if getattr(self.model, "requires_chunks", False) else self.model.branch_scores(x)
         return np.clip(branches @ self.model.branch_weights_, 1e-5, 1 - 1e-5)
 
     def map_scores(self, raw: np.ndarray, *, batch_map: bool = True) -> np.ndarray:

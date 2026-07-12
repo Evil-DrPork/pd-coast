@@ -143,6 +143,7 @@ class Miner(BaseMinerNeuron):
                 model_repo_root / "model_v3" / "features.py",
                 model_repo_root / "model_v3" / "schema.py",
                 model_repo_root / "model_v3" / "model.py",
+                model_repo_root / "model_v3" / "neural.py",
                 model_repo_root / "model_v3" / "calibration.py",
                 model_repo_root / "model_v3" / "metrics.py",
                 model_repo_root / "model_v3" / "train.py",

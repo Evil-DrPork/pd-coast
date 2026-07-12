@@ -13,6 +13,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import RobustScaler, StandardScaler
 
+from .neural import HierarchicalSetModel, NeuralConfig
+
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
     x = np.clip(np.asarray(x, float), -30, 30)
@@ -123,3 +125,50 @@ def choose_weights(oof_branches: np.ndarray, y: np.ndarray, scorer) -> np.ndarra
                 candidates.append((objective, w))
     return max(candidates, key=lambda z: z[0])[1]
 
+
+class V3HybridEnsemble:
+    """Tabular ensemble plus hierarchical multiple-instance neural branch."""
+
+    requires_chunks = True
+
+    def __init__(self, seed: int = 44, neural_config: NeuralConfig | None = None, device: str = "cpu"):
+        self.seed = int(seed)
+        self.base = V3Ensemble(seed)
+        self.neural = HierarchicalSetModel(neural_config or NeuralConfig(), seed=seed, device=device)
+        self.branch_weights_ = np.asarray([0.20, 0.10, 0.35, 0.10, 0.25], float)
+
+    def fit(self, x: np.ndarray, y: np.ndarray, chunks) -> "V3HybridEnsemble":
+        self.base.fit(x, y); self.neural.fit(chunks, y)
+        return self
+
+    def branch_scores(self, x: np.ndarray, chunks=None) -> np.ndarray:
+        if chunks is None:
+            raise ValueError("hybrid ensemble requires raw chunks for the neural branch")
+        base = self.base.branch_scores(x)
+        neural = self.neural.predict_proba(chunks)[:, 1]
+        return np.column_stack([base, neural])
+
+
+def choose_hybrid_weights(
+    oof_branches: np.ndarray, y: np.ndarray, scorer,
+    merged_branches: np.ndarray | None = None, merged_y: np.ndarray | None = None,
+) -> np.ndarray:
+    """Select base composition, then the neural share, using OOF ranking only."""
+    if oof_branches.shape[1] != 5:
+        return choose_weights(oof_branches, y, scorer)
+    base_weights = choose_weights(oof_branches[:, :4], y, scorer)
+    candidates = []
+    for neural_share in np.arange(0.0, 0.61, 0.05):
+        weights = np.concatenate([base_weights * (1.0 - neural_share), [neural_share]])
+        m = scorer(y, oof_branches @ weights)
+        original_objective = 0.6 * m["ap_score"] + 0.4 * m["bot_recall"]
+        if merged_branches is not None and merged_y is not None and len(merged_y):
+            mm = scorer(merged_y, merged_branches @ weights)
+            merged_objective = 0.6 * mm["ap_score"] + 0.4 * mm["bot_recall"]
+            # Live evaluation uses large chunks, but retain a meaningful guard
+            # against destroying original-chunk ranking.
+            objective = 0.35 * original_objective + 0.65 * merged_objective
+        else:
+            objective = original_objective
+        candidates.append((objective, weights))
+    return max(candidates, key=lambda item: item[0])[1]

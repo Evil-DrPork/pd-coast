@@ -8,6 +8,8 @@ Fresh, validator-native baseline for unordered poker-hand chunks.
 - action order retained only inside each hand;
 - hand-order-invariant distribution features;
 - logistic, ExtraTrees, histogram-gradient and human-tail prototype ensemble;
+- hierarchical action Transformer → hand embedding → permutation-invariant hand-set neural branch;
+- OOF promotion gate: the neural challenger is packaged only when its selected weight is at least 2.5%;
 - date-blocked out-of-fold blending;
 - direct import of the production validator reward;
 - fixed and batch-relative monotone score mapping;
@@ -31,7 +33,9 @@ python -m detection_model.model_v3.train \
   --data detection_model/data_v3/benchmark_chunks_2026-07-06_to_2026-07-12.json \
   --out detection_model/artifacts/p44_v3.joblib \
   --report detection_model/artifacts/p44_v3_train_report.json \
-  --reward-window 100
+  --reward-window 100 \
+  --neural-epochs 12 \
+  --merged-ratio 0.60
 ```
 
 For a genuinely future holdout, train only through the prior day:
