@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .calibration import apply_batch_mapper
 from .inference import Poker44V3Detector
 from .metrics import format_metrics, metrics, simulate_windows
 from .schema import canonicalize_chunks, load_chunks
@@ -20,6 +21,7 @@ def parse_args():
     ap.add_argument("--out", default=None, help="Optional JSON report/predictions.")
     ap.add_argument("--canonicalize", choices=("auto", "always", "never"), default="auto")
     ap.add_argument("--window-simulations", type=int, default=3000)
+    ap.add_argument("--reward-window", type=int, default=100, help="Evaluate complete live-sized windows.")
     ap.add_argument("--stability-samples", type=int, default=32)
     ap.add_argument("--seed", type=int, default=44)
     ap.add_argument("--no-batch-map", action="store_true")
@@ -54,10 +56,15 @@ def main() -> None:
     if all(v is not None for v in labels):
         y = np.asarray(labels, int)
         m = metrics(y, score_arr)
-        windows = simulate_windows(y, score_arr, repetitions=args.window_simulations, seed=args.seed)
+        raw = detector.raw_scores(hands)
+        windows = simulate_windows(
+            y, raw, window=args.reward_window,
+            repetitions=args.window_simulations, seed=args.seed,
+            score_transform=lambda s: apply_batch_mapper(s, detector.batch_top_fraction),
+        )
         report["metrics"] = m; report["window_metrics"] = windows
         print(format_metrics(m))
-        print("40-window reward:", {k: round(v, 4) for k, v in windows.items()})
+        print(f"{args.reward_window}-chunk window reward:", {k: round(v, 4) for k, v in windows.items()})
     else:
         print("Unlabeled dataset: accuracy/reward cannot be computed.")
         print("Prediction summary:", {
@@ -73,4 +80,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

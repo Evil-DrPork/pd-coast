@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Callable, Dict, Optional
 
 import numpy as np
 
@@ -32,28 +32,32 @@ def simulate_windows(
     labels: np.ndarray,
     scores: np.ndarray,
     *,
-    window: int = 40,
+    window: int = 100,
     repetitions: int = 3000,
     seed: int = 44,
+    score_transform: Optional[Callable[[np.ndarray], np.ndarray]] = None,
 ) -> Dict[str, float]:
     y, s = np.asarray(labels, int), np.asarray(scores, float)
     if len(y) < window:
-        m = metrics(y, s)
+        evaluated = score_transform(s.copy()) if score_transform else s
+        m = metrics(y, evaluated)
         return {"mean": m["reward"], "median": m["reward"], "p10": m["reward"], "std": 0.0}
     rng = np.random.default_rng(seed)
     pos, neg = np.flatnonzero(y == 1), np.flatnonzero(y == 0)
     rewards = []
     for _ in range(repetitions):
         # Balanced windows mirror current public material. Replacement is used
-        # only when a held-out fold has fewer than 20 of one class.
+        # only when a held-out fold has fewer than window/2 of one class.
         p = rng.choice(pos, window // 2, replace=len(pos) < window // 2)
         n = rng.choice(neg, window - window // 2, replace=len(neg) < window - window // 2)
         idx = np.concatenate([p, n])
         rng.shuffle(idx)
-        rewards.append(metrics(y[idx], s[idx])["reward"])
+        window_scores = s[idx]
+        if score_transform is not None:
+            window_scores = score_transform(window_scores.copy())
+        rewards.append(metrics(y[idx], window_scores)["reward"])
     a = np.asarray(rewards)
     return {
         "mean": float(a.mean()), "median": float(np.median(a)),
         "p10": float(np.quantile(a, 0.10)), "std": float(a.std()),
     }
-

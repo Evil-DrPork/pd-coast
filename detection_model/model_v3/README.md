@@ -30,7 +30,8 @@ Then train:
 python -m detection_model.model_v3.train \
   --data detection_model/data_v3/benchmark_chunks_2026-07-06_to_2026-07-12.json \
   --out detection_model/artifacts/p44_v3.joblib \
-  --report detection_model/artifacts/p44_v3_train_report.json
+  --report detection_model/artifacts/p44_v3_train_report.json \
+  --reward-window 100
 ```
 
 For a genuinely future holdout, train only through the prior day:
@@ -50,7 +51,8 @@ Use a date that was not included in training for the strongest test:
 python -m detection_model.model_v3.evaluate \
   --data detection_model/data_v3/benchmark_chunks_YYYY-MM-DD.json \
   --model detection_model/artifacts/p44_v3.joblib \
-  --out detection_model/artifacts/p44_v3_eval_YYYY-MM-DD.json
+  --out detection_model/artifacts/p44_v3_eval_YYYY-MM-DD.json \
+  --reward-window 100
 ```
 
 ## Inspect an unlabeled evaluation set

@@ -17,7 +17,7 @@ import joblib
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
 
-from .calibration import apply_mapper, fit_fixed_mapper
+from .calibration import apply_batch_mapper, apply_mapper, fit_fixed_mapper
 from .features import FEATURE_NAMES, matrix_for_chunks
 from .metrics import format_metrics, metrics, simulate_windows
 from .model import V3Ensemble, choose_weights
@@ -65,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max-date", default=None, help="Train only source_date <= YYYY-MM-DD (walk-forward holdout).")
     ap.add_argument("--seed", type=int, default=44)
     ap.add_argument("--window-simulations", type=int, default=3000)
+    ap.add_argument("--reward-window", type=int, default=100, help="Observed live scoring batch/window size.")
     ap.add_argument("--batch-top-fraction", type=float, default=0.20)
     return ap.parse_args()
 
@@ -110,10 +111,14 @@ def main() -> None:
     mapper = fit_fixed_mapper(oof_raw, y, target_human_fpr=0.05)
     oof_score = apply_mapper(oof_raw, mapper)
     overall = metrics(y, oof_score)
-    windows = simulate_windows(y, oof_score, repetitions=args.window_simulations, seed=args.seed)
+    windows = simulate_windows(
+        y, oof_raw, window=args.reward_window,
+        repetitions=args.window_simulations, seed=args.seed,
+        score_transform=lambda s: apply_batch_mapper(s, args.batch_top_fraction),
+    )
     print("OOF weights:", np.round(weights, 3).tolist())
     print("OOF:", format_metrics(overall))
-    print("40-window reward:", {k: round(v, 4) for k, v in windows.items()})
+    print(f"{args.reward_window}-chunk window reward:", {k: round(v, 4) for k, v in windows.items()})
 
     final_model = V3Ensemble(args.seed).fit(x, y)
     final_model.branch_weights_ = weights
@@ -123,6 +128,7 @@ def main() -> None:
         "feature_names": FEATURE_NAMES,
         "mapper": mapper,
         "batch_top_fraction": float(args.batch_top_fraction),
+        "reward_window": int(args.reward_window),
         "canonicalizer_mode": args.canonicalize,
         "training_data": str(args.data),
         "training_count": int(len(y)),

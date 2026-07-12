@@ -41,8 +41,7 @@ class Poker44V3Detector:
         x = matrix_for_chunks(clean)
         branches = self.model.branch_scores(x)
         raw = np.clip(branches @ self.model.branch_weights_, 1e-5, 1 - 1e-5)
-        fixed = apply_mapper(raw, self.mapper)
-        scores = apply_batch_mapper(raw, self.batch_top_fraction) if batch_map and len(chunks) >= 8 else fixed
+        scores = self.map_scores(raw, batch_map=batch_map)
         scores = np.nan_to_num(scores, nan=0.5, posinf=0.99, neginf=0.01)
         values = [round(float(np.clip(v, 0.01, 0.99)), 8) for v in scores]
         if not return_diagnostics:
@@ -60,3 +59,16 @@ class Poker44V3Detector:
     def predict_chunk(self, chunk: List[Dict[str, Any]]) -> float:
         return self.predict_chunks([chunk], batch_map=False)[0]
 
+    def raw_scores(self, chunks: List[List[Dict[str, Any]]]) -> np.ndarray:
+        """Return the uncalibrated ensemble scores for reusable window analysis."""
+        clean = [[clean_hand(h) for h in (chunk or []) if isinstance(h, dict)] for chunk in chunks]
+        x = matrix_for_chunks(clean)
+        branches = self.model.branch_scores(x)
+        return np.clip(branches @ self.model.branch_weights_, 1e-5, 1 - 1e-5)
+
+    def map_scores(self, raw: np.ndarray, *, batch_map: bool = True) -> np.ndarray:
+        raw = np.asarray(raw, float)
+        fixed = apply_mapper(raw, self.mapper)
+        if batch_map and len(raw) >= 8:
+            return apply_batch_mapper(raw, self.batch_top_fraction)
+        return fixed
