@@ -35,8 +35,13 @@ python -m detection_model.model_v3.train \
   --report detection_model/artifacts/p44_v3_train_report.json \
   --reward-window 100 \
   --neural-epochs 12 \
+  --neural-log-every 1 \
   --merged-ratio 0.60
 ```
+
+Neural logs show the fold tag, original/merged sample counts, parameter count,
+device, per-epoch total/BCE/pairwise losses, validation loss, best checkpoints,
+elapsed time, and early stopping.
 
 For a genuinely future holdout, train only through the prior day:
 

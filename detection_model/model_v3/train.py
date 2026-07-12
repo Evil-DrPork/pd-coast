@@ -73,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--neural-batch-size", type=int, default=8)
     ap.add_argument("--neural-device", default="cpu")
     ap.add_argument("--merged-ratio", type=float, default=0.60)
+    ap.add_argument("--neural-log-every", type=int, default=1, help="Print neural progress every N epochs; 0 disables.")
     return ap.parse_args()
 
 
@@ -111,7 +112,8 @@ def main() -> None:
         else:
             neural_cfg = NeuralConfig(
                 epochs=args.neural_epochs, batch_size=args.neural_batch_size,
-                merged_ratio=args.merged_ratio,
+                merged_ratio=args.merged_ratio, log_every=args.neural_log_every,
+                tag=f"{name} neural",
             )
             model = V3HybridEnsemble(args.seed + fold_i, neural_cfg, args.neural_device).fit(
                 x[tr], y[tr], [chunks[i].hands for i in tr]
@@ -175,7 +177,8 @@ def main() -> None:
     else:
         final_cfg = NeuralConfig(
             epochs=args.neural_epochs, batch_size=args.neural_batch_size,
-            merged_ratio=args.merged_ratio,
+            merged_ratio=args.merged_ratio, log_every=args.neural_log_every,
+            tag="final neural",
         )
         final_model = V3HybridEnsemble(args.seed, final_cfg, args.neural_device).fit(
             x, y, [c.hands for c in chunks]

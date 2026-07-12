@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -101,6 +102,8 @@ class NeuralConfig:
     merged_sources: int = 3
     merged_min_hands: int = 80
     merged_max_hands: int = 100
+    log_every: int = 1
+    tag: str = "neural"
 
 
 class _ChunkDataset(Dataset):
@@ -223,6 +226,7 @@ class HierarchicalSetModel:
         self.state_dict_: Optional[Dict[str, torch.Tensor]] = None
 
     def fit(self, chunks, labels):
+        started = time.perf_counter()
         torch.manual_seed(self.seed); np.random.seed(self.seed)
         y = np.asarray(labels, int); rng = np.random.default_rng(self.seed)
         train_idx, val_idx = [], []
@@ -231,6 +235,7 @@ class HierarchicalSetModel:
             nval = max(1, int(round(0.12 * len(idx))))
             val_idx.extend(idx[:nval]); train_idx.extend(idx[nval:])
         tr_chunks = [chunks[i] for i in train_idx]; tr_y = y[train_idx]
+        original_train_count = len(tr_chunks)
         aug, aug_y = merged_augmentation(tr_chunks, tr_y, self.config, self.seed + 991)
         tr_chunks = tr_chunks + aug; tr_y = np.concatenate([tr_y, aug_y])
         va_chunks = [chunks[i] for i in val_idx]; va_y = y[val_idx]
@@ -244,12 +249,23 @@ class HierarchicalSetModel:
             shuffle=False, collate_fn=collate,
         )
         model = HierarchicalSetNet(self.config).to(self.device)
+        parameter_count = sum(parameter.numel() for parameter in model.parameters())
+        if self.config.log_every > 0:
+            print(
+                f"[{self.config.tag}] start | device={self.device} params={parameter_count:,} "
+                f"train_original={original_train_count} train_merged={len(aug)} "
+                f"train_total={len(tr_chunks)} validation={len(va_chunks)} "
+                f"epochs={self.config.epochs} batch={self.config.batch_size}",
+                flush=True,
+            )
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=self.config.learning_rate, weight_decay=self.config.weight_decay
         )
         bce = nn.BCEWithLogitsLoss(); best = float("inf"); best_state = None; bad = 0
-        for _ in range(self.config.epochs):
+        best_epoch = 0
+        for epoch in range(1, self.config.epochs + 1):
             model.train()
+            train_total = 0.0; train_bce = 0.0; train_pair = 0.0; train_count = 0
             for batch in train_loader:
                 logits = model(*(batch[k].to(self.device) for k in ("cat", "cont", "action_mask", "hand_mask", "hand_meta")))
                 labels_b = batch["labels"].to(self.device)
@@ -258,17 +274,47 @@ class HierarchicalSetModel:
                 pair = torch.nn.functional.softplus(-(pos[:, None] - neg[None, :])).mean() if len(pos) and len(neg) else base * 0
                 loss = 0.65 * base + 0.35 * pair
                 optimizer.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
+                count = len(labels_b)
+                train_total += float(loss.detach()) * count
+                train_bce += float(base.detach()) * count
+                train_pair += float(pair.detach()) * count
+                train_count += count
             val_loss = self._loss(model, val_loader, bce)
-            if val_loss < best - 1e-4:
-                best = val_loss; bad = 0
+            improved = val_loss < best - 1e-4
+            if improved:
+                best = val_loss; bad = 0; best_epoch = epoch
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             else:
                 bad += 1
-                if bad >= self.config.patience:
-                    break
+            if self.config.log_every > 0 and (
+                epoch == 1 or epoch % self.config.log_every == 0 or improved or epoch == self.config.epochs
+            ):
+                print(
+                    f"[{self.config.tag}] epoch {epoch:02d}/{self.config.epochs} | "
+                    f"loss={train_total/max(1, train_count):.4f} "
+                    f"bce={train_bce/max(1, train_count):.4f} "
+                    f"pair={train_pair/max(1, train_count):.4f} "
+                    f"val={val_loss:.4f} {'*best' if improved else ''} "
+                    f"bad={bad}/{self.config.patience} elapsed={time.perf_counter()-started:.1f}s",
+                    flush=True,
+                )
+            if bad >= self.config.patience:
+                if self.config.log_every > 0:
+                    print(
+                        f"[{self.config.tag}] early-stop | epoch={epoch} "
+                        f"best_epoch={best_epoch} best_val={best:.4f}",
+                        flush=True,
+                    )
+                break
         if best_state is None:
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         self.state_dict_ = best_state
+        if self.config.log_every > 0:
+            print(
+                f"[{self.config.tag}] done | best_epoch={best_epoch or self.config.epochs} "
+                f"best_val={best:.4f} elapsed={time.perf_counter()-started:.1f}s",
+                flush=True,
+            )
         return self
 
     def _loss(self, model, loader, loss_fn):
