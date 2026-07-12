@@ -46,6 +46,34 @@ def build_model(seed: int, n_pos: int, n_neg: int):
     )
 
 
+def monotone_constraints(X: np.ndarray, y: np.ndarray, min_abs_corr: float = 0.15):
+    """Per-feature {-1,0,1} constraint = sign(corr with label) for sign-stable
+    features (|corr| >= threshold), else 0. Data-driven — no wrong-direction
+    guessing. Constrained features force the tree to be monotone in them, which
+    is drift-robust (the enemy's 'mono' member does this over 72 features)."""
+    X = np.asarray(X, dtype=float); y = np.asarray(y, dtype=float)
+    yc = y - y.mean()
+    Xc = X - X.mean(axis=0)
+    denom = np.sqrt((Xc ** 2).sum(axis=0)) * np.sqrt((yc ** 2).sum()) + 1e-12
+    corr = (Xc * yc[:, None]).sum(axis=0) / denom
+    cons = np.where(np.abs(corr) >= min_abs_corr, np.sign(corr), 0.0).astype(int)
+    return cons.tolist()
+
+
+def build_monotone_model(seed: int, n_pos: int, n_neg: int, monotone):
+    """Deeper, monotone-constrained LGBM member for the rank blend."""
+    if not _HAVE_LGBM:
+        return build_model(seed, n_pos, n_neg)
+    return LGBMClassifier(
+        n_estimators=500, learning_rate=0.025, num_leaves=31, max_depth=7,
+        min_child_samples=25, subsample=0.9, subsample_freq=1,
+        colsample_bytree=0.8, reg_lambda=3.0,
+        monotone_constraints=list(monotone), monotone_constraints_method="advanced",
+        random_state=seed, n_jobs=0, verbose=-1,
+        class_weight="balanced" if abs(n_pos - n_neg) > 0.1 * (n_pos + n_neg) else None,
+    )
+
+
 def _proba(model, x: np.ndarray) -> np.ndarray:
     p = model.predict_proba(x)
     return np.asarray(p[:, 1] if p.ndim == 2 else p, dtype=float)

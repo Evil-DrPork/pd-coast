@@ -12,6 +12,7 @@ the LightGBM model, then passed through the embedded cliff-aware calibrator so t
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 import warnings
 from pathlib import Path
@@ -24,6 +25,14 @@ warnings.filterwarnings("ignore", message="X does not have valid feature names")
 from .calibrate import apply_calibrator
 from .features import chunk_feature_vector
 from .schema import _sort_actions
+
+
+def rank01(s: np.ndarray) -> np.ndarray:
+    """Batch-relative rank in [0,1] (calibration-free; robust to member collapse)."""
+    s = np.asarray(s, dtype=float)
+    if s.size <= 1:
+        return np.zeros_like(s)
+    return np.argsort(np.argsort(s, kind="stable"), kind="stable").astype(float) / (s.size - 1)
 
 
 def _alias_model_v2_packages() -> None:
@@ -67,16 +76,29 @@ class Poker44V2Detector:
         metadata: Dict[str, Any] | None = None,
         seq_model: Any = None,
         blend_weights: Any = None,
+        blend_mode: str = "prob",
+        subbag_hands: int = 35,
+        subbag_stride: int = 20,
+        subbag_min_hands: int = 50,
     ) -> None:
         self.model = model
         self.calibrator = calibrator
         self.feature_names = list(feature_names)
         self.threshold = float(threshold)
         self.metadata = dict(metadata or {})
-        # Optional TCN sequence learner blended with the LightGBM. When present,
-        # the served score is blend_weights[0]*lgbm + blend_weights[1]*tcn.
+        # Optional TCN sequence learner blended with the LightGBM. blend_mode
+        # "prob" combines probabilities; "rank" combines batch-relative ranks
+        # (calibration-free, robust to one member collapsing on a shifted feed).
         self.seq_model = seq_model
         self.blend_weights = tuple(blend_weights) if blend_weights is not None else None
+        self.blend_mode = str(blend_mode or "prob")
+        # Sub-bagging: chunks with > subbag_min_hands hands are split into
+        # training-sized (subbag_hands) single-entity sub-samples, each scored
+        # in-distribution, then averaged per chunk. Fixes the train(small)/serve
+        # (large) size gap without pooling across entities. subbag_hands<=0 = off.
+        self.subbag_hands = int(subbag_hands)
+        self.subbag_stride = max(1, int(subbag_stride))
+        self.subbag_min_hands = int(subbag_min_hands)
 
     @classmethod
     def load(cls, path: str | Path) -> "Poker44V2Detector":
@@ -102,6 +124,10 @@ class Poker44V2Detector:
             metadata={"backend": art.get("backend"), "val_metrics": art.get("val_metrics")},
             seq_model=seq,
             blend_weights=art.get("blend_weights"),
+            blend_mode=art.get("blend_mode", "prob"),
+            subbag_hands=int(os.getenv("P44_SUBBAG_HANDS", "35")),
+            subbag_stride=int(os.getenv("P44_SUBBAG_STRIDE", "20")),
+            subbag_min_hands=int(os.getenv("P44_SUBBAG_MIN_HANDS", "50")),
         )
 
     @property
@@ -121,21 +147,52 @@ class Poker44V2Detector:
         proba = self.model.predict_proba(x)
         return np.asarray(proba[:, 1] if getattr(proba, "ndim", 1) == 2 else proba, dtype=float)
 
+    def _subsamples(self, hands: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        """Split a chunk into training-sized single-entity sub-samples (or [hands])."""
+        n = len(hands)
+        size = self.subbag_hands
+        if size <= 0 or n <= max(size, self.subbag_min_hands):
+            return [hands]
+        subs = [hands[s:s + size] for s in range(0, n - size + 1, self.subbag_stride)]
+        return subs or [hands]
+
+    def _member_scores(self, chunks: List[List[Dict[str, Any]]]):
+        """Per-chunk raw member scores, sub-bagged: mean over in-distribution sub-samples."""
+        all_subs: List[List[Dict[str, Any]]] = []
+        ranges: List[tuple] = []
+        cursor = 0
+        for chunk in chunks:
+            hands = [_sort_actions(h) for h in (chunk or []) if isinstance(h, dict)]
+            subs = self._subsamples(hands)
+            ranges.append((cursor, cursor + len(subs)))
+            all_subs.extend(subs)
+            cursor += len(subs)
+
+        lgbm_sub = self._raw_scores(self._feature_rows(all_subs)) if self.model is not None else None
+        seq_sub = np.asarray(self.seq_model.predict_proba(all_subs))[:, 1] if self.seq_model is not None else None
+
+        def _agg(sub):
+            if sub is None:
+                return None
+            return np.array([float(np.mean(sub[a:b])) if b > a else 0.5 for a, b in ranges])
+
+        return _agg(lgbm_sub), _agg(seq_sub)
+
     def predict_chunks(self, chunks: List[List[Dict[str, Any]]], return_raw: bool = False) -> List[float]:
         """Return one calibrated bot-risk score per chunk (higher = more bot-like)."""
         if not chunks:
             return []
-        if self.model is not None:
-            raw = self._raw_scores(self._feature_rows(chunks))
-        else:
-            raw = np.zeros(len(chunks), dtype=float)   # TCN-only: no LGBM half
-        if self.seq_model is not None:
-            seq = np.asarray(self.seq_model.predict_proba(chunks))[:, 1]
+        lgbm_raw, seq_raw = self._member_scores(chunks)
+        raw = lgbm_raw if lgbm_raw is not None else np.zeros(len(chunks), dtype=float)
+        if seq_raw is not None:
             if self.blend_weights is not None:
                 w0, w1 = self.blend_weights
-                raw = w0 * raw + w1 * seq
+                if self.blend_mode == "rank" and self.model is not None:
+                    raw = (w0 * rank01(raw) + w1 * rank01(seq_raw)) / (w0 + w1)
+                else:
+                    raw = w0 * raw + w1 * seq_raw
             else:
-                raw = seq
+                raw = seq_raw
         raw = np.clip(raw, 0.0, 1.0)
         if return_raw or not self.has_calibrator:
             return [round(float(v), 6) for v in raw]

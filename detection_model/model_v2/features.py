@@ -16,6 +16,7 @@ Design rules baked in:
 
 from __future__ import annotations
 
+import hashlib
 import math
 from collections import Counter
 from typing import Any, Dict, List, Tuple
@@ -238,6 +239,92 @@ def _agg(prefix: str, values: np.ndarray, out: Dict[str, float]) -> None:
     out[f"{prefix}_q75"] = float(np.quantile(values, 0.75))
 
 
+_REF_SIZE = 30            # reference chunk size for size-invariant signature features
+_REF_SAMPLES = 5          # sub-samples averaged when a chunk exceeds _REF_SIZE
+_AGG_ORD = {a: i for i, a in enumerate(ACTION_TYPES)}   # fold=0 .. raise=4
+
+
+def _transition_features(act_sigs: List[Tuple[str, ...]]) -> Dict[str, float]:
+    """Within-hand action-order (n-gram) signal, aggregated to chunk level.
+
+    Captures exactly what the TCN's within-hand encoder learned — the *order* of
+    actions inside a hand — but as cheap, order-invariant-across-hands tabular
+    features. Bots tend to have low transition entropy / high repeat / rigid
+    escalation; humans vary more. Derived from the already-computed per-hand
+    action-type signatures, so it costs almost nothing.
+    """
+    bigrams: List[Tuple[str, str]] = []
+    firsts: List[str] = []
+    lasts: List[str] = []
+    ntrans: List[int] = []
+    esc = dees = rep = fold_after_agg = 0
+    total = 0
+    for sig in act_sigs:
+        if sig:
+            firsts.append(sig[0])
+            lasts.append(sig[-1])
+        for a, b in zip(sig, sig[1:]):
+            bigrams.append((a, b))
+            total += 1
+            oa, ob = _AGG_ORD.get(a), _AGG_ORD.get(b)
+            if oa is not None and ob is not None:
+                if ob > oa:
+                    esc += 1
+                elif ob < oa:
+                    dees += 1
+                if a == b:
+                    rep += 1
+                if oa >= 3 and b == "fold":     # bet/raise then fold within the hand
+                    fold_after_agg += 1
+        ntrans.append(max(len(sig) - 1, 0))
+    top = max(Counter(bigrams).values()) if bigrams else 0
+    return {
+        "transition_entropy": _entropy(bigrams),
+        "top_transition_share": _ratio(top, total),
+        "unique_bigram_ratio": _ratio(len(set(bigrams)), total),
+        "escalation_transition_rate": _ratio(esc, total),
+        "deescalation_transition_rate": _ratio(dees, total),
+        "repeat_action_transition_rate": _ratio(rep, total),
+        "fold_after_aggression_rate": _ratio(fold_after_agg, total),
+        "first_action_entropy": _entropy(firsts),
+        "last_action_entropy": _entropy(lasts),
+        "mean_transitions_per_hand": float(np.mean(ntrans)) if ntrans else 0.0,
+    }
+
+
+def _chunk_seed(act_sigs) -> int:
+    """Deterministic seed from chunk content (stable across processes)."""
+    h = hashlib.md5(repr(act_sigs).encode("utf-8")).digest()
+    return int.from_bytes(h[:4], "little")
+
+
+def _signature_at_ref(act_sigs, amt_sigs, ref: int, k: int, seed: int) -> Dict[str, float]:
+    """Signature stats measured at a FIXED reference size, so they read the same at
+    35 and 85 hands (removes the size bias in top/unique pattern shares)."""
+    n = len(act_sigs)
+    if n <= ref:
+        na = float(max(n, 1))
+        return {
+            "unique_action_pattern_ratio_at30": _ratio(len(set(act_sigs)), na),
+            "top_action_pattern_share_at30": _ratio(max(Counter(act_sigs).values()), na) if act_sigs else 0.0,
+            "unique_amount_pattern_ratio_at30": _ratio(len(set(amt_sigs)), na),
+            "top_amount_pattern_share_at30": _ratio(max(Counter(amt_sigs).values()), na) if amt_sigs else 0.0,
+        }
+    import numpy as _np
+    rng = _np.random.default_rng(seed)
+    acc = {"unique_action_pattern_ratio_at30": 0.0, "top_action_pattern_share_at30": 0.0,
+           "unique_amount_pattern_ratio_at30": 0.0, "top_amount_pattern_share_at30": 0.0}
+    for _ in range(k):
+        idx = rng.choice(n, size=ref, replace=False)
+        aa = [act_sigs[i] for i in idx]
+        ab = [amt_sigs[i] for i in idx]
+        acc["unique_action_pattern_ratio_at30"] += len(set(aa)) / ref
+        acc["top_action_pattern_share_at30"] += max(Counter(aa).values()) / ref
+        acc["unique_amount_pattern_ratio_at30"] += len(set(ab)) / ref
+        acc["top_amount_pattern_share_at30"] += max(Counter(ab).values()) / ref
+    return {kk: vv / k for kk, vv in acc.items()}
+
+
 def chunk_feature_vector(hands: List[Dict[str, Any]]) -> Dict[str, float]:
     """One row of features for a chunk (list of hand dicts). Order-invariant."""
     out: Dict[str, float] = {"num_hands": float(len(hands))}
@@ -269,6 +356,11 @@ def chunk_feature_vector(hands: List[Dict[str, Any]]) -> Dict[str, float]:
         + hf["acted_after_fold_ratio"] + hf["pot_mismatch_ratio"]
         for hf in per_hand
     ]))
+    # --- size-invariant features (Phase 6): log size + fixed-reference signatures ---
+    out["hand_count_log"] = math.log1p(len(hands))
+    out.update(_signature_at_ref(act_sigs, amt_sigs, _REF_SIZE, _REF_SAMPLES, _chunk_seed(act_sigs)))
+    # --- within-hand action-order (n-gram) features: the TCN replacement ---
+    out.update(_transition_features(act_sigs))
     return out
 
 
@@ -276,6 +368,13 @@ _CHUNK_ONLY_KEYS: Tuple[str, ...] = (
     "unique_action_pattern_ratio", "top_action_pattern_share",
     "unique_amount_pattern_ratio", "top_amount_pattern_share",
     "chunk_aggression_dispersion", "chunk_action_entropy_mean", "chunk_anomaly_load",
+    "hand_count_log",
+    "unique_action_pattern_ratio_at30", "top_action_pattern_share_at30",
+    "unique_amount_pattern_ratio_at30", "top_amount_pattern_share_at30",
+    "transition_entropy", "top_transition_share", "unique_bigram_ratio",
+    "escalation_transition_rate", "deescalation_transition_rate",
+    "repeat_action_transition_rate", "fold_after_aggression_rate",
+    "first_action_entropy", "last_action_entropy", "mean_transitions_per_hand",
 )
 
 

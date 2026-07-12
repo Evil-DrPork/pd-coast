@@ -211,6 +211,8 @@ class TCNSequenceModel:
     seed: int = 44
     device: str = "cpu"
     verbose: bool = False
+    log_every: int = 0          # >0 prints a progress line every N epochs (flushed)
+    tag: str = "tcn"            # label for progress lines (e.g. "fold 2/3 tcn")
     _state: Optional[Dict[str, Any]] = field(default=None, repr=False)
 
     def _encode(self, chunks):
@@ -233,27 +235,46 @@ class TCNSequenceModel:
         opt = torch.optim.AdamW(model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         loss_fn = nn.BCEWithLogitsLoss(pos_weight=pw)
 
-        best, best_state, bad = float("inf"), None, 0
+        import time
+        nparams = sum(p.numel() for p in model.parameters())
+        t0 = time.time()
+        if self.log_every > 0:
+            print(f"  [{self.tag}] TCN {nparams:,} params | train={len(ti)} val={len(vi)} "
+                  f"| epochs={self.epochs} batch={self.batch_size}", flush=True)
+
+        best, best_state, bad, best_ep = float("inf"), None, 0, 0
         for ep in range(self.epochs):
             model.train()
+            tr_tot, tr_n = 0.0, 0
             for bt in tl:
                 logit = model(bt["cat"].to(self.device), bt["cont"].to(self.device),
                               bt["amask"].to(self.device), bt["hmask"].to(self.device))
                 loss = loss_fn(logit, bt["y"].to(self.device))
                 opt.zero_grad(); loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
+                tr_tot += float(loss.item()) * len(bt["y"]); tr_n += len(bt["y"])
             vloss = self._val_loss(model, vl, loss_fn)
-            if self.verbose:
-                print(f"    tcn epoch {ep+1}/{self.epochs} val_loss={vloss:.4f}")
-            if vloss + 1e-5 < best:
-                best, bad = vloss, 0
+            improved = vloss + 1e-5 < best
+            if improved:
+                best, bad, best_ep = vloss, 0, ep + 1
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             else:
                 bad += 1
-                if bad >= self.patience:
-                    break
+            if self.log_every > 0 and ((ep + 1) % self.log_every == 0 or ep == 0 or improved):
+                print(f"  [{self.tag}] epoch {ep+1:2d}/{self.epochs} "
+                      f"train_loss={tr_tot/max(tr_n,1):.4f} val_loss={vloss:.4f}"
+                      f"{' *best' if improved else ''} | {time.time()-t0:5.1f}s", flush=True)
+            elif self.verbose:
+                print(f"    tcn epoch {ep+1}/{self.epochs} val_loss={vloss:.4f}", flush=True)
+            if bad >= self.patience:
+                if self.log_every > 0:
+                    print(f"  [{self.tag}] early stop at epoch {ep+1} (patience {self.patience})", flush=True)
+                break
         if best_state is not None:
             model.load_state_dict(best_state)
+        if self.log_every > 0:
+            print(f"  [{self.tag}] done: best val_loss={best:.4f} @epoch {best_ep} "
+                  f"| {time.time()-t0:.1f}s total", flush=True)
         self._state = {"state_dict": {k: v.cpu() for k, v in model.state_dict().items()}, "config": self.config.to_dict()}
         return self
 
