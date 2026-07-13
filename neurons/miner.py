@@ -42,6 +42,13 @@ except Exception as exc:  # pragma: no cover - keep the miner alive on import er
     Poker44V3Detector = None
     MODEL_IMPORT_ERROR = str(exc)
 
+try:
+    from detection_model.model_v3_large.inference import Poker44V3LargeDetector
+    LARGE_MODEL_IMPORT_ERROR = ""
+except Exception as exc:  # pragma: no cover - stable v3 must remain independently usable
+    Poker44V3LargeDetector = None
+    LARGE_MODEL_IMPORT_ERROR = str(exc)
+
 
 def _sha256_file(path: str | Path) -> str:
     path = Path(path).expanduser()
@@ -122,6 +129,12 @@ class Miner(BaseMinerNeuron):
         # default to disabled (0) -> scores pass through unchanged.
         self.top_k = int(os.getenv("P44_TOP_K", "0"))
         self.top_k_frac = float(os.getenv("P44_TOP_K_FRAC", "0"))
+        try:
+            self.latency_warn_seconds = float(
+                os.getenv("P44_LATENCY_WARN_SECONDS", "25")
+            )
+        except (TypeError, ValueError):
+            self.latency_warn_seconds = 25.0
 
         self.detector = None
         self.model_manifest = self._build_model_manifest(repo_root, model_repo_root)
@@ -136,19 +149,30 @@ class Miner(BaseMinerNeuron):
 
     def _build_model_manifest(self, repo_root: Path, model_repo_root: Path) -> dict:
         model_artifact_path = Path(self.model_path).expanduser()
-        implementation_files = _existing_paths(
-            [
-                Path(__file__).resolve(),
-                model_repo_root / "model_v3" / "inference.py",
-                model_repo_root / "model_v3" / "features.py",
-                model_repo_root / "model_v3" / "schema.py",
-                model_repo_root / "model_v3" / "model.py",
-                model_repo_root / "model_v3" / "neural.py",
-                model_repo_root / "model_v3" / "calibration.py",
-                model_repo_root / "model_v3" / "metrics.py",
-                model_repo_root / "model_v3" / "train.py",
-            ]
-        )
+        detector_variant = os.getenv("P44_DETECTOR_VARIANT", "v3").strip().lower()
+        is_large = detector_variant in {"large", "v3_large"}
+        implementation_paths = [
+            Path(__file__).resolve(),
+            model_repo_root / "model_v3" / "inference.py",
+            model_repo_root / "model_v3" / "features.py",
+            model_repo_root / "model_v3" / "schema.py",
+            model_repo_root / "model_v3" / "model.py",
+            model_repo_root / "model_v3" / "neural.py",
+            model_repo_root / "model_v3" / "calibration.py",
+            model_repo_root / "model_v3" / "metrics.py",
+            model_repo_root / "model_v3" / "train.py",
+        ]
+        if is_large:
+            implementation_paths.extend(
+                [
+                    model_repo_root / "model_v3_large" / "inference.py",
+                    model_repo_root / "model_v3_large" / "features.py",
+                    model_repo_root / "model_v3_large" / "model.py",
+                    model_repo_root / "model_v3_large" / "tabular.py",
+                    model_repo_root / "model_v3_large" / "augmentation.py",
+                ]
+            )
+        implementation_files = _existing_paths(implementation_paths)
         artifact_sha256 = os.getenv("POKER44_MODEL_ARTIFACT_SHA256", _sha256_file(model_artifact_path))
 
         # Auto-derive the git identity so the manifest is transparent-compliant
@@ -165,8 +189,13 @@ class Miner(BaseMinerNeuron):
             implementation_files=implementation_files,
             defaults={
                 "open_source": True,
-                "model_name": os.getenv("P44_MANIFEST_MODEL_NAME", "p44-v3-order-free-ensemble"),
-                "model_version": os.getenv("P44_MANIFEST_MODEL_VERSION", "3.0.0"),
+                "model_name": os.getenv(
+                    "P44_MANIFEST_MODEL_NAME",
+                    "p44-v3-large-multiscale" if is_large else "p44-v3-order-free-ensemble",
+                ),
+                "model_version": os.getenv(
+                    "P44_MANIFEST_MODEL_VERSION", "3.1.0" if is_large else "3.0.0"
+                ),
                 "framework": os.getenv(
                     "P44_MANIFEST_FRAMEWORK", "scikit-learn-order-free-ensemble"
                 ),
@@ -197,11 +226,17 @@ class Miner(BaseMinerNeuron):
                 ),
                 "inference_mode": "remote",
                 "notes": (
-                    "Poker44 model_v3 detector. Distributional order-invariant chunk features -> "
+                    f"Poker44 {'large-chunk challenger' if is_large else 'model_v3 detector'}. "
+                    "Distributional order-invariant chunk features -> "
                     "regularized linear/tree ensemble plus human-tail prototype -> monotone "
                     "query-batch boundary mapper. All hands are used; action order is preserved "
                     "only within each hand and no cross-hand order is assumed. "
-                    f"Local artifact: {model_artifact_path}"
+                    + (
+                        "Training includes 50-75 and 80-100 hand same-label public-benchmark "
+                        "mixtures plus deterministic permutation-invariant micro-bags. "
+                        if is_large else ""
+                    )
+                    + f"Local artifact: {model_artifact_path}"
                 ),
             },
         )
@@ -218,12 +253,26 @@ class Miner(BaseMinerNeuron):
             return
 
         try:
-            bt.logging.info(f"Loading model_v3 ensemble from: {model_path}")
-            self.detector = Poker44V3Detector.load(model_path)
+            variant = os.getenv("P44_DETECTOR_VARIANT", "v3").strip().lower()
+            detector_class = (
+                Poker44V3LargeDetector if variant in {"large", "v3_large"}
+                else Poker44V3Detector
+            )
+            if detector_class is None:
+                import_error = (
+                    LARGE_MODEL_IMPORT_ERROR
+                    if variant in {"large", "v3_large"}
+                    else MODEL_IMPORT_ERROR
+                )
+                raise RuntimeError(
+                    f"detector variant {variant!r} is unavailable: {import_error}"
+                )
+            bt.logging.info(f"Loading {variant} ensemble from: {model_path}")
+            self.detector = detector_class.load(model_path)
             env_threshold = os.getenv("P44_PREDICTION_THRESHOLD")
             if env_threshold is not None:
                 self.prediction_threshold = float(env_threshold)
-            bt.logging.info("✅ model_v3 loaded successfully")
+            bt.logging.info(f"✅ {variant} detector loaded successfully")
             bt.logging.info(
                 f"features: {len(self.detector.artifact.get('feature_names', []))} | "
                 f"training chunks: {self.detector.artifact.get('training_count')} | "
@@ -327,6 +376,7 @@ class Miner(BaseMinerNeuron):
             synapse.model_manifest = dict(self.model_manifest)
             return synapse
 
+        request_started = time.perf_counter()
         try:
             if self.detector is None:
                 bt.logging.warning("Trained model not loaded. Using heuristic fallback.")
@@ -344,16 +394,24 @@ class Miner(BaseMinerNeuron):
             synapse.model_manifest = dict(self.model_manifest)
 
             effective_k = self._resolve_top_k(len(scores))
+            elapsed = time.perf_counter() - request_started
             bt.logging.info(
                 f"Scored {len(chunks)} chunks with "
                 f"{'model_v3 ensemble' if self.detector else 'heuristic fallback'} | "
+                f"latency={elapsed:.3f}s | "
                 f"top_k={effective_k or 'off'} bots={sum(s >= 0.5 for s in scores)} | "
                 f"preview={scores}"
             )
+            if self.latency_warn_seconds > 0 and elapsed >= self.latency_warn_seconds:
+                bt.logging.warning(
+                    f"Inference latency sentry: {elapsed:.3f}s exceeded "
+                    f"P44_LATENCY_WARN_SECONDS={self.latency_warn_seconds:.3f}s"
+                )
             return synapse
 
         except Exception as exc:
-            bt.logging.error(f"Inference failed: {exc}")
+            elapsed = time.perf_counter() - request_started
+            bt.logging.error(f"Inference failed after {elapsed:.3f}s: {exc}")
             try:
                 fallback = [self.score_chunk(chunk) for chunk in chunks]
             except Exception as fallback_exc:
