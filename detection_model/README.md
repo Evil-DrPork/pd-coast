@@ -1,5 +1,11 @@
 # Poker44 Detection Model
 
+> **Current path:** the promotion-qualified real-data challenger is
+> [`model_v4`](model_v4/README.md); stable rollback remains
+> [`model_v3`](model_v3/README.md). The hierarchical/XGBoost material below is
+> retained as the legacy V2 workflow and should not be used to infer the current
+> validator reward.
+
 Hierarchical encoder + XGBoost head + **reward-aware calibration**.
 
 > New here? Read [`docs/training-strategy.md`](docs/training-strategy.md) — it
@@ -26,11 +32,13 @@ Hierarchical encoder + XGBoost head + **reward-aware calibration**.
   cliff. It recenters the decision boundary so the miner needs no hand-rolled
   calibration. AP is preserved (calibration is rank-invariant).
 
-## What the reward demands
+## What the current reward demands
 
-The validator weights `0.65 * average_precision + 0.35 * bot_recall`, then zeroes
-the reward if chunk-level FPR ≥ 0.10. So: the **model** owns ranking/AP, and the
-**calibrator** banks it safely under the FPR cliff. See the strategy doc.
+The authoritative implementation is `poker44/score/scoring.py`: 0.35 AP, 0.30
+best recall at FPR <= 0.05, 0.20 human safety, 0.10 calibration safety, and 0.05
+latency quality. `detection_model/model/scoring.py` is now only a compatibility
+wrapper around that implementation, so training cannot silently use the former
+0.65-AP/0.35-hard-recall formula.
 
 ## Pipeline notes
 

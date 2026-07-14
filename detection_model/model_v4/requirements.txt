@@ -1,0 +1,6 @@
+# Exact environment used to build p44_v4_coherent.joblib.
+# Scikit-learn does not support loading persisted estimators across versions.
+numpy==2.4.4
+scipy==1.17.1
+scikit-learn==1.8.0
+joblib==1.5.3
