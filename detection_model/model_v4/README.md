@@ -75,7 +75,7 @@ Current artifact:
 
 ```text
 detection_model/artifacts/p44_v4_coherent.joblib
-SHA-256 10a8349930565d258cda80773a7cb876a1f944bd2aab9f8392466db428d965d9
+SHA-256 6a5dea8ad339e5c8f211475fc68b315dd883363bbc5c181e8d46389c346b13ee
 ```
 
 Generated artifacts and public datasets are intentionally git-ignored. Copy or
@@ -126,10 +126,18 @@ Use one mapper only:
 P44_DETECTOR_VARIANT=v4
 P44_MODEL_PATH=detection_model/artifacts/p44_v4_coherent.joblib
 P44_REQUIRE_MODEL=1
-POKER44_MODEL_ARTIFACT_SHA256=10a8349930565d258cda80773a7cb876a1f944bd2aab9f8392466db428d965d9
+POKER44_MODEL_ARTIFACT_SHA256=6a5dea8ad339e5c8f211475fc68b315dd883363bbc5c181e8d46389c346b13ee
 P44_TOP_K=0
 P44_TOP_K_FRAC=0
 ```
+
+The artifact records its exact Python, NumPy, SciPy, scikit-learn and joblib
+versions. A different serving environment is unsupported by scikit-learn and
+is rejected by default. For a controlled equivalence test only, set
+`P44_ALLOW_RUNTIME_MISMATCH=1`; detector-runtime and library-version mismatches
+then emit explicit warnings while artifact SHA, architecture, feature schema,
+feature implementation and branch-schema validation remain enforced. Remove
+the override or retrain in the serving environment if predictions differ.
 
 Rollback requires only changing the variant/path back to stable V3; no V3
 implementation or artifact was overwritten.

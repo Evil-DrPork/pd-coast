@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
@@ -24,6 +26,28 @@ from .model import BRANCH_NAMES, blend_branches
 from .provenance import DETECTOR_RUNTIME_SHA256, RUNTIME_LIBRARY_VERSIONS
 
 
+def _allow_runtime_mismatch() -> bool:
+    """Return whether the operator explicitly accepts an unsupported runtime."""
+    return os.getenv("P44_ALLOW_RUNTIME_MISMATCH", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _runtime_mismatch(message: str) -> None:
+    """Reject runtime drift unless the operator enabled the canary override."""
+    if not _allow_runtime_mismatch():
+        raise ValueError(message)
+    warnings.warn(
+        f"{message}. Continuing because P44_ALLOW_RUNTIME_MISMATCH=1; "
+        "compare scores against the qualified artifact before promotion",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 class Poker44V4Detector:
     """Load, validate and serve a V4 real-only coherent ensemble."""
 
@@ -38,16 +62,29 @@ class Poker44V4Detector:
             raise ValueError("V4 feature schema fingerprint mismatch; retrain the artifact")
         if artifact.get("feature_implementation_sha256") != FEATURE_IMPLEMENTATION_SHA256:
             raise ValueError("V4 feature implementation mismatch; retrain the artifact")
-        if artifact.get("detector_runtime_sha256") != DETECTOR_RUNTIME_SHA256:
-            raise ValueError("V4 detector runtime mismatch; retrain the artifact")
+        artifact_runtime = artifact.get("detector_runtime_sha256")
+        if artifact_runtime != DETECTOR_RUNTIME_SHA256:
+            _runtime_mismatch(
+                "V4 detector runtime mismatch: "
+                f"artifact={artifact_runtime!r} runtime={DETECTOR_RUNTIME_SHA256!r}"
+            )
         self.artifact = artifact
         self.model = artifact["model"]
         if tuple(getattr(self.model, "branch_names", ())) != BRANCH_NAMES:
             raise ValueError("V4 branch schema mismatch; retrain the artifact")
-        if artifact.get("runtime_library_versions") != RUNTIME_LIBRARY_VERSIONS:
-            raise ValueError(
-                "V4 runtime library mismatch; use the pinned V4 requirements "
-                "or retrain the artifact"
+        artifact_versions = artifact.get("runtime_library_versions")
+        if artifact_versions != RUNTIME_LIBRARY_VERSIONS:
+            expected = artifact_versions if isinstance(artifact_versions, dict) else {}
+            names = sorted(set(expected) | set(RUNTIME_LIBRARY_VERSIONS))
+            differences = ", ".join(
+                f"{name}: artifact={expected.get(name)!r} "
+                f"runtime={RUNTIME_LIBRARY_VERSIONS.get(name)!r}"
+                for name in names
+                if expected.get(name) != RUNTIME_LIBRARY_VERSIONS.get(name)
+            )
+            _runtime_mismatch(
+                "V4 runtime library mismatch"
+                + (f" ({differences})" if differences else "")
             )
         self.mapper = dict(artifact["mapper"])
         reference = artifact.get("feature_reference")

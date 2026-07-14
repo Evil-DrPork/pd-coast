@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import joblib
 import numpy as np
@@ -308,6 +310,14 @@ class ModelV4CoherentTests(unittest.TestCase):
         before, before_diagnostics = Poker44V4Detector(artifact).predict_chunks(
             hands, return_diagnostics=True
         )
+        mismatched = dict(artifact)
+        mismatched["detector_runtime_sha256"] = "different-runtime"
+        mismatched["runtime_library_versions"] = {"python": "different-version"}
+        with patch.dict(os.environ, {"P44_ALLOW_RUNTIME_MISMATCH": "1"}):
+            with self.assertWarnsRegex(RuntimeWarning, "P44_ALLOW_RUNTIME_MISMATCH=1"):
+                override = Poker44V4Detector(mismatched)
+            override_scores = override.predict_chunks(hands)
+        self.assertEqual(before, override_scores)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trusted_v4_roundtrip.joblib"
             joblib.dump(artifact, path)
