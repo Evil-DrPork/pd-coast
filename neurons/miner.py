@@ -2,8 +2,8 @@
 
 Pipeline per validator chunk:
     chunk -> order-invariant hand/chunk features (actions sorted by action_id)
-          -> selected V3/V4 detector (regularized ensemble + monotone batch
-             boundary mapping)
+          -> selected V3/V4 detector
+          -> regularized ensemble + monotone batch boundary mapping
           -> one calibrated risk_score per chunk
 
 An optional top-K cap forces only the K highest-scoring chunks above the 0.5
@@ -56,6 +56,17 @@ except Exception as exc:  # pragma: no cover - stable v3 must remain independent
     Poker44V4Detector = None
     V4_MODEL_IMPORT_ERROR = str(exc)
 
+try:
+    from detection_model.model_v4_2.inference import Poker44V42Detector
+    V42_MODEL_IMPORT_ERROR = ""
+except Exception as exc:  # pragma: no cover - V4.1/V3 remain independently usable
+    Poker44V42Detector = None
+    V42_MODEL_IMPORT_ERROR = str(exc)
+
+
+V4_VARIANTS = frozenset({"v4", "v4_coherent", "coherent"})
+V42_VARIANTS = frozenset({"v4_2"})
+
 
 def _sha256_file(path: str | Path) -> str:
     path = Path(path).expanduser()
@@ -69,7 +80,14 @@ def _sha256_file(path: str | Path) -> str:
 
 
 def _existing_paths(paths: list[str | Path]) -> list[Path]:
-    return [p for p in (Path(x).expanduser() for x in paths) if p.exists() and p.is_file()]
+    resolved = [Path(value).expanduser() for value in paths]
+    missing = [path for path in resolved if not path.exists() or not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing model implementation files: "
+            + ", ".join(str(path) for path in missing)
+        )
+    return resolved
 
 
 def _git(args: list[str], repo_root: Path) -> str:
@@ -164,7 +182,9 @@ class Miner(BaseMinerNeuron):
         model_artifact_path = Path(self.model_path).expanduser()
         detector_variant = os.getenv("P44_DETECTOR_VARIANT", "v3").strip().lower()
         is_large = detector_variant in {"large", "v3_large"}
-        is_v4 = detector_variant in {"v4", "v4_coherent", "coherent"}
+        is_v42 = detector_variant in V42_VARIANTS
+        is_v4 = detector_variant in V4_VARIANTS
+        is_v4_family = is_v4 or is_v42
         implementation_paths = [
             Path(__file__).resolve(),
             model_repo_root / "model_v3" / "inference.py",
@@ -175,6 +195,8 @@ class Miner(BaseMinerNeuron):
             model_repo_root / "model_v3" / "calibration.py",
             model_repo_root / "model_v3" / "metrics.py",
             model_repo_root / "model_v3" / "train.py",
+            repo_root / "poker44" / "validator" / "payload_view.py",
+            repo_root / "poker44" / "score" / "scoring.py",
         ]
         if is_large:
             implementation_paths.extend(
@@ -186,7 +208,7 @@ class Miner(BaseMinerNeuron):
                     model_repo_root / "model_v3_large" / "augmentation.py",
                 ]
             )
-        if is_v4:
+        if is_v4_family:
             implementation_paths.extend(
                 [
                     model_repo_root / "model_v4" / "inference.py",
@@ -198,8 +220,37 @@ class Miner(BaseMinerNeuron):
                     model_repo_root / "model_v4" / "train.py",
                 ]
             )
+        if is_v42:
+            implementation_paths.extend(
+                [
+                    model_repo_root / "model_v4_2" / "__init__.py",
+                    model_repo_root / "model_v4_2" / "inference.py",
+                    model_repo_root / "model_v4_2" / "selection.py",
+                ]
+            )
         implementation_files = _existing_paths(implementation_paths)
         artifact_sha256 = os.getenv("POKER44_MODEL_ARTIFACT_SHA256", _sha256_file(model_artifact_path))
+
+        if is_v42:
+            default_model_name = "p44-v4.2-policy-challenger"
+            default_model_version = "4.2.0"
+            default_framework = "scikit-learn-ensemble"
+            detector_description = "V4.2 serving-policy challenger"
+        elif is_v4:
+            default_model_name = "p44-v4-ensemble"
+            default_model_version = "4.1.0"
+            default_framework = "scikit-learn-ensemble"
+            detector_description = "V4.1 public-benchmark detector"
+        elif is_large:
+            default_model_name = "p44-v3-large-multiscale"
+            default_model_version = "3.1.0"
+            default_framework = "scikit-learn-order-free-ensemble"
+            detector_description = "large-chunk challenger"
+        else:
+            default_model_name = "p44-v3-order-free-ensemble"
+            default_model_version = "3.0.0"
+            default_framework = "scikit-learn-order-free-ensemble"
+            detector_description = "model_v3 detector"
 
         # Auto-derive the git identity so the manifest is transparent-compliant
         # out of the box (env vars still take precedence for overrides).
@@ -217,25 +268,15 @@ class Miner(BaseMinerNeuron):
                 "open_source": True,
                 "model_name": os.getenv(
                     "P44_MANIFEST_MODEL_NAME",
-                    (
-                        "p44-v4-coherent-rank-robust"
-                        if is_v4
-                        else "p44-v3-large-multiscale"
-                        if is_large
-                        else "p44-v3-order-free-ensemble"
-                    ),
+                    default_model_name,
                 ),
                 "model_version": os.getenv(
                     "P44_MANIFEST_MODEL_VERSION",
-                    "4.1.0" if is_v4 else "3.1.0" if is_large else "3.0.0",
+                    default_model_version,
                 ),
                 "framework": os.getenv(
                     "P44_MANIFEST_FRAMEWORK",
-                    (
-                        "scikit-learn-coherent-rank-robust-ensemble"
-                        if is_v4
-                        else "scikit-learn-order-free-ensemble"
-                    ),
+                    default_framework,
                 ),
                 "license": os.getenv("P44_MANIFEST_LICENSE", "MIT"),
                 "repo_url": repo_url,
@@ -244,51 +285,38 @@ class Miner(BaseMinerNeuron):
                 "artifact_sha256": artifact_sha256,
                 "model_card_url": os.getenv("P44_MANIFEST_MODEL_CARD_URL", ""),
                 "training_data_statement": (
-                    "Trained only on the public Poker44 benchmark, canonicalized through the "
-                    "validator's public miner-payload transform to match the served distribution. "
-                    "No validator-only evaluation data, hidden labels, or leaked validator payloads "
-                    "were used."
+                    "Trained only on the public Poker44 benchmark projected to the public "
+                    "miner-visible schema. No validator-only evaluation data, hidden labels, "
+                    "or leaked validator payloads were used."
                 ),
                 "training_data_sources": [
                     "public Poker44 benchmark chunks (api.poker44.net)",
-                    "canonicalized copies of the public benchmark (validator payload_view transform)",
+                    "public miner-visible projections of the benchmark payloads",
                 ],
                 "private_data_attestation": (
                     "This miner does not train on validator-only evaluation data, live eval "
                     "batches, hidden validator labels, or any private validator data."
                 ),
                 "data_attestation": (
-                    "All training data is the public Poker44 benchmark (api.poker44.net) and "
-                    "canonicalized copies derived from it. No private, scraped, or validator-side "
-                    "data is used; the published repo and commit reproduce the full model flow."
+                    "All training sources are public Poker44 benchmark data. No private, "
+                    "scraped, or validator-side data is used. The published commit identifies "
+                    "the serving and training source; the deployed artifact is pinned by SHA-256."
                 ),
-                "inference_mode": "remote",
+                "inference_mode": "local",
                 "notes": (
-                    f"Poker44 {'coherent real-data challenger' if is_v4 else 'large-chunk challenger' if is_large else 'model_v3 detector'}. "
-                    "Distributional order-invariant chunk features -> "
-                    "regularized linear/tree ensemble plus human-tail prototype -> monotone "
-                    "query-batch boundary mapper. All hands are used; action order is preserved "
-                    "only within each hand and no cross-hand order is assumed. "
-                    + (
-                        "Training includes 50-75 and 80-100 hand same-label public-benchmark "
-                        "mixtures plus deterministic permutation-invariant micro-bags. "
-                        if is_large else ""
-                    )
-                    + (
-                        "Training uses real public chunks only, broad chronological history, "
-                        "and exact within-chunk behavioral-coherence signatures; no synthetic "
-                        "cross-source merges or micro-bag pseudo-labels are used. Request-relative "
-                        "feature-rank branches protect ranking under numeric domain shift. "
-                        if is_v4 else ""
-                    )
-                    + f"Local artifact: {model_artifact_path}"
+                    f"Poker44 {detector_description}. "
+                    "Deterministic local inference using the pinned artifact and the "
+                    "implementation files at the published repository commit."
                 ),
             },
         )
 
     def _load_trained_model(self) -> None:
         variant = os.getenv("P44_DETECTOR_VARIANT", "v3").strip().lower()
-        if variant in {"v4", "v4_coherent", "coherent"}:
+        if variant in V42_VARIANTS:
+            detector_class = Poker44V42Detector
+            import_error = V42_MODEL_IMPORT_ERROR
+        elif variant in V4_VARIANTS:
             detector_class = Poker44V4Detector
             import_error = V4_MODEL_IMPORT_ERROR
         elif variant in {"large", "v3_large"}:
@@ -369,6 +397,19 @@ class Miner(BaseMinerNeuron):
         """Whole-chunk, order-invariant scoring via the selected detector."""
         if self.detector is None:
             return [self.score_chunk(chunk) for chunk in chunks]
+        if (
+            Poker44V42Detector is not None
+            and isinstance(self.detector, Poker44V42Detector)
+        ):
+            valid_counts = [
+                sum(isinstance(hand, dict) for hand in (chunk or []))
+                for chunk in chunks
+            ]
+            if any(count < self.detector.hand_cap for count in valid_counts):
+                bt.logging.warning(
+                    "V4.2 preprocessing policy was not applied because the request "
+                    f"shape is outside its supported range: counts={valid_counts}"
+                )
         return self.detector.predict_chunks(chunks)
 
     def _finalize_score(self, score: float) -> float:

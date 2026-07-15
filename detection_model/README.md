@@ -1,7 +1,7 @@
 # Poker44 Detection Model
 
-> **Current path:** the promotion-qualified real-data challenger is
-> [`model_v4`](model_v4/README.md); stable rollback remains
+> **Current path:** the current public-benchmark detector is
+> [`model_v4`](model_v4/README.md), and stable rollback remains
 > [`model_v3`](model_v3/README.md). The hierarchical/XGBoost material below is
 > retained as the legacy V2 workflow and should not be used to infer the current
 > validator reward.

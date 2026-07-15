@@ -1,9 +1,34 @@
+import tempfile
 import unittest
+from pathlib import Path
 
-from poker44.utils.model_manifest import evaluate_manifest_compliance
+from poker44.utils.model_manifest import _sha256_for_files, evaluate_manifest_compliance
 
 
 class ModelManifestComplianceTests(unittest.TestCase):
+    def test_implementation_hash_is_checkout_and_line_ending_portable(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as first_dir,
+            tempfile.TemporaryDirectory() as second_dir,
+        ):
+            first = Path(first_dir)
+            second = Path(second_dir)
+            for root, newline in ((first, b"\r\n"), (second, b"\n")):
+                package = root / "package"
+                package.mkdir()
+                (package / "a.py").write_bytes(newline.join((b"alpha", b"beta", b"")))
+                (package / "b.txt").write_bytes(newline.join((b"one", b"two", b"")))
+
+            first_hash = _sha256_for_files(
+                [first / "package" / "b.txt", first / "package" / "a.py"],
+                repo_root=first,
+            )
+            second_hash = _sha256_for_files(
+                [second / "package" / "a.py", second / "package" / "b.txt"],
+                repo_root=second,
+            )
+            self.assertEqual(first_hash, second_hash)
+
     def test_reference_miner_manifest_can_use_reference_repo(self) -> None:
         manifest = {
             "open_source": True,

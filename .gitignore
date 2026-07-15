@@ -31,6 +31,11 @@ runs/*
 #IDE
 .vscode
 PythonImportHelper-v2-Completion
+.claude/settings.local.json
+
+# Private local research notes and experiment outputs
+private_research/
+detection_model/private_research/
 
 # Distribution / packaging
 .Python

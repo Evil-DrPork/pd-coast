@@ -29,16 +29,27 @@ def _parse_bool(value: str | None, *, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _sha256_for_files(paths: Iterable[Path]) -> str:
+def _normalized_source_bytes(path: Path) -> bytes:
+    return path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+
+def _sha256_for_files(paths: Iterable[Path], *, repo_root: Path) -> str:
+    root = repo_root.resolve()
+    entries: List[tuple[str, Path]] = []
+    for raw_path in paths:
+        path = raw_path.resolve()
+        if not path.is_relative_to(root):
+            raise ValueError(f"implementation file is outside repository root: {path}")
+        entries.append((path.relative_to(root).as_posix(), path))
+
     digest = hashlib.sha256()
-    for path in sorted((p.resolve() for p in paths), key=lambda p: str(p)):
-        digest.update(str(path).encode("utf-8"))
-        with path.open("rb") as handle:
-            while True:
-                chunk = handle.read(1024 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
+    for relative, path in sorted(entries, key=lambda item: item[0]):
+        name = relative.encode("utf-8")
+        payload = _normalized_source_bytes(path)
+        digest.update(len(name).to_bytes(4, "big"))
+        digest.update(name)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
     return digest.hexdigest()
 
 
@@ -50,7 +61,10 @@ def build_local_model_manifest(
 ) -> Dict[str, Any]:
     """Build a serializable manifest for the miner's current implementation."""
     implementation_paths = [path.resolve() for path in implementation_files]
-    implementation_sha256 = _sha256_for_files(implementation_paths)
+    implementation_sha256 = _sha256_for_files(
+        implementation_paths,
+        repo_root=repo_root,
+    )
     default_values = dict(defaults or {})
 
     manifest: Dict[str, Any] = {
@@ -121,7 +135,9 @@ def build_local_model_manifest(
         ).strip(),
         "implementation_sha256": implementation_sha256,
         "implementation_files": [
-            str(path.relative_to(repo_root)) if path.is_relative_to(repo_root) else str(path)
+            path.relative_to(repo_root.resolve()).as_posix()
+            if path.is_relative_to(repo_root.resolve())
+            else path.as_posix()
             for path in implementation_paths
         ],
         "notes": os.getenv(
