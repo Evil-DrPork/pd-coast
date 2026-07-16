@@ -63,9 +63,17 @@ except Exception as exc:  # pragma: no cover - V4.1/V3 remain independently usab
     Poker44V42Detector = None
     V42_MODEL_IMPORT_ERROR = str(exc)
 
+try:
+    from detection_model.model_v4_3.inference import Poker44V43Detector
+    V43_MODEL_IMPORT_ERROR = ""
+except Exception as exc:  # pragma: no cover - older variants remain independently usable
+    Poker44V43Detector = None
+    V43_MODEL_IMPORT_ERROR = str(exc)
+
 
 V4_VARIANTS = frozenset({"v4", "v4_coherent", "coherent"})
 V42_VARIANTS = frozenset({"v4_2"})
+V43_VARIANTS = frozenset({"v4_3"})
 
 
 def _sha256_file(path: str | Path) -> str:
@@ -183,8 +191,9 @@ class Miner(BaseMinerNeuron):
         detector_variant = os.getenv("P44_DETECTOR_VARIANT", "v3").strip().lower()
         is_large = detector_variant in {"large", "v3_large"}
         is_v42 = detector_variant in V42_VARIANTS
+        is_v43 = detector_variant in V43_VARIANTS
         is_v4 = detector_variant in V4_VARIANTS
-        is_v4_family = is_v4 or is_v42
+        is_v4_family = is_v4 or is_v42 or is_v43
         implementation_paths = [
             Path(__file__).resolve(),
             model_repo_root / "model_v3" / "inference.py",
@@ -228,10 +237,25 @@ class Miner(BaseMinerNeuron):
                     model_repo_root / "model_v4_2" / "selection.py",
                 ]
             )
+        if is_v43:
+            implementation_paths.extend(
+                [
+                    model_repo_root / "model_v4_3" / "__init__.py",
+                    model_repo_root / "model_v4_3" / "inference.py",
+                ]
+            )
         implementation_files = _existing_paths(implementation_paths)
         artifact_sha256 = os.getenv("POKER44_MODEL_ARTIFACT_SHA256", _sha256_file(model_artifact_path))
 
-        if is_v42:
+        if is_v43:
+            v43_alpha = os.getenv("P44_V43_CONSENSUS_ALPHA", "0.20").strip()
+            default_model_name = "p44-v4.3-consensus-challenger"
+            default_model_version = "4.3.0"
+            default_framework = "scikit-learn-ensemble"
+            detector_description = (
+                f"V4.3 low-latency consensus challenger (configured alpha={v43_alpha})"
+            )
+        elif is_v42:
             default_model_name = "p44-v4.2-policy-challenger"
             default_model_version = "4.2.0"
             default_framework = "scikit-learn-ensemble"
@@ -313,7 +337,10 @@ class Miner(BaseMinerNeuron):
 
     def _load_trained_model(self) -> None:
         variant = os.getenv("P44_DETECTOR_VARIANT", "v3").strip().lower()
-        if variant in V42_VARIANTS:
+        if variant in V43_VARIANTS:
+            detector_class = Poker44V43Detector
+            import_error = V43_MODEL_IMPORT_ERROR
+        elif variant in V42_VARIANTS:
             detector_class = Poker44V42Detector
             import_error = V42_MODEL_IMPORT_ERROR
         elif variant in V4_VARIANTS:
